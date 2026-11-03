@@ -1,0 +1,46 @@
+{
+  "name": "snappaste",
+  "productName": "SnapPaste",
+  "version": "0.1.0",
+  "description": "Capture what you see. Paste what you need.",
+  "private": true,
+  "type": "module",
+  "main": ".vite/build/main.cjs",
+  "scripts": {
+    "native:build": "node scripts/build-native.mjs",
+    "start": "npm run native:build && electron-forge start",
+    "package": "npm run native:build && electron-forge package",
+    "make": "npm run native:build && electron-forge make",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.0.0"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "8.0.1",
+    "@electron-forge/maker-zip": "8.0.1",
+    "@electron-forge/plugin-vite": "8.0.1",
+    "@electron-forge/shared-types": "8.0.1",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "latest",
+    "electron": "45.2.1",
+    "prettier": "^3.9.10",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.0",
+    "vite": "8.3.5"
+  },
+  "overrides": {
+    "glob": "^14.0.2",
+    "minimatch": "^11.0.1"
+  },
+  "config": {
+    "forge": "./forge.config.ts"
+  }
+}

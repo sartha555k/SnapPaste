@@ -1,0 +1,12 @@
+node_modules/
+.vite/
+out/
+native/bin/
+native/.module-cache/
+.DS_Store
+.env
+.env.*
+!.env.example
+coverage/
+work/
+*.log
