@@ -4,10 +4,19 @@ const api: SnapPasteAPI = {
   getSettings: () => ipcRenderer.invoke("settings:get"),
   saveSettings: (value) => ipcRenderer.invoke("settings:save", value),
   getCapture: () => ipcRenderer.invoke("capture:get"),
+  listHistory: (offset) => ipcRenderer.invoke("history:list", offset),
+  selectHistory: (id) => ipcRenderer.invoke("history:select", id),
+  onHistory: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on("history:changed", listener);
+    return () => {
+      ipcRenderer.removeListener("history:changed", listener);
+    };
+  },
   readClipboard: () => ipcRenderer.invoke("capture:clipboard"),
   importImage: () => ipcRenderer.invoke("capture:import"),
   captureScreen: () => ipcRenderer.invoke("capture:screen"),
-  loadExample: () => ipcRenderer.invoke("capture:example"),
+  loadExample: (kind) => ipcRenderer.invoke("capture:example", kind),
   analyze: () => ipcRenderer.invoke("capture:analyze"),
   generate: (id, action, instruction) =>
     ipcRenderer.invoke("result:generate", id, action, instruction),

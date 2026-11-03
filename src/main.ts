@@ -13,7 +13,8 @@ import {
   systemPreferences,
   Tray,
 } from "electron";
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -26,9 +27,12 @@ import type {
   Capture,
   PasteResult,
   SettingsUpdate,
+  Analysis,
+  HistoryItem,
 } from "./shared/types";
 import { getSettings, saveSettings, validateSettings } from "./main/settings";
 import { analyzeCapture, generateOutput } from "./main/providers";
+import { HistoryStore } from "./main/history";
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string;
 declare const MAIN_WINDOW_VITE_NAME: string;
@@ -41,7 +45,13 @@ let destinationPid = 0;
 let quitting = false;
 let controller: AbortController | null = null;
 let tempDirectory = "";
-let lastImagePath = "";
+let history: HistoryStore;
+let watcher: ChildProcess | null = null;
+let screenshotActive = false;
+const analysisCache = new Map<
+  string,
+  { fingerprint: string; analysis: Analysis; text: string }
+>();
 const helper = () =>
   app.isPackaged
     ? path.join(process.resourcesPath, "SnapPasteHelper")
@@ -67,113 +77,244 @@ async function rememberDestination() {
     /* Copy remains available even when native app focus cannot be read. */
   }
 }
-async function showPanel(readImage = false) {
-  await rememberDestination();
-  const compact = readImage;
-  window.setSize(compact ? 460 : 1040, compact ? 680 : 760);
+function positionPanel(compact: boolean) {
+  window.setAlwaysOnTop(compact, "floating");
+  window.setVisibleOnAllWorkspaces(compact, { visibleOnFullScreen: compact });
+  window.setSize(compact ? 480 : 1040, compact ? 720 : 760);
   window.webContents.send("window:mode", compact);
   const { x, y } = screen.getCursorScreenPoint();
   const { workArea } = screen.getDisplayNearestPoint({ x, y });
   const [width, height] = window.getSize();
   window.setPosition(
     Math.round(workArea.x + (workArea.width - width) / 2),
-    Math.round(workArea.y + Math.max(20, (workArea.height - height) / 2)),
+    Math.round(workArea.y + Math.max(10, (workArea.height - height) / 2)),
   );
   window.show();
   window.focus();
-  if (readImage) void readClipboard().catch((error) => notice(error.message));
+}
+async function showPanel(paste = false) {
+  await rememberDestination();
+  positionPanel(paste);
+  if (paste) void smartPaste().catch((error) => notice(error.message));
 }
 function startJob(): AbortController {
   controller?.abort();
   controller = new AbortController();
   return controller;
 }
-async function prepareImage(
+function historyChanged() {
+  window?.webContents.send("history:changed");
+}
+async function storeImage(
   image: Electron.NativeImage,
   name: string,
-): Promise<Capture> {
+): Promise<HistoryItem> {
   if (image.isEmpty())
     throw new Error("That image could not be opened. Try a PNG or JPEG.");
-  const size = image.getSize();
-  if (
-    size.width > 16000 ||
-    size.height > 16000 ||
-    size.width * size.height > 40_000_000
-  )
+  const { width, height } = image.getSize();
+  if (width > 16000 || height > 16000 || width * height > 40_000_000)
     throw new Error(
       "That image is too large. Select a smaller screenshot region.",
     );
-  const job = startJob();
   const png = image.toPNG();
+  if (png.length > 20 * 1024 * 1024)
+    throw new Error("Choose an image smaller than 20 MB.");
+  const scale = Math.min(1, 200 / width, 140 / height);
+  const thumbnail = image
+    .resize({
+      width: Math.max(1, Math.round(width * scale)),
+      height: Math.max(1, Math.round(height * scale)),
+      quality: "good",
+    })
+    .toPNG();
+  const item = await history.add(png, thumbnail, { name, width, height });
+  historyChanged();
+  return item;
+}
+async function clipboardImage(): Promise<Electron.NativeImage | null> {
+  for (const item of await clipboard.read()) {
+    const type = item.types.find((t) =>
+      ["image/png", "image/jpeg", "image/tiff"].includes(t),
+    );
+    if (!type) continue;
+    const blob = await item.getType(type);
+    if (!(blob instanceof Blob) || blob.size > 20 * 1024 * 1024)
+      throw new Error(
+        "The clipboard image is too large. Try a smaller screenshot.",
+      );
+    const image = nativeImage.createFromBuffer(
+      Buffer.from(await blob.arrayBuffer()),
+    );
+    return image.isEmpty() ? null : image;
+  }
+  return null;
+}
+async function selectHistory(id: string) {
+  const job = startJob();
+  capture = null;
+  window.webContents.send("capture", null);
+  const { item, image } = await history.get(id);
+  if (job.signal.aborted) return;
+  const settings = getSettings();
+  const fingerprint = `hierarchy-v2:${settings.jevModel}:${settings.cloudEnabled}:${settings.hasJevKey}`;
+  const cached = analysisCache.get(id);
   const next: Capture = {
-    id: randomUUID(),
-    name,
-    dataUrl: `data:image/png;base64,${png.toString("base64")}`,
-    width: size.width,
-    height: size.height,
-    bytes: png.length,
-    ocrText: "",
-    analysis: localAnalysis(""),
+    id,
+    name: item.name,
+    dataUrl: `data:image/png;base64,${image.toString("base64")}`,
+    width: item.width,
+    height: item.height,
+    bytes: item.bytes,
+    ocrText: cached?.text ?? "",
+    analysis: {
+      ...localAnalysis(""),
+      actions: [ACTIONS.text],
+      stage: "category",
+    },
     phase: "reading",
   };
   capture = next;
   emit();
-  const imagePath = path.join(tempDirectory, `${next.id}.png`);
-  await writeFile(imagePath, png, { mode: 0o600 });
-  const previousPath = lastImagePath;
-  lastImagePath = imagePath;
-  if (previousPath) await rm(previousPath, { force: true }).catch(() => {});
-  try {
-    const ocr = await native("ocr", imagePath);
-    if (job.signal.aborted || capture?.id !== next.id) return next;
-    next.ocrText = ocr.text;
-    next.analysis = localAnalysis(ocr.text);
+  if (cached && cached.fingerprint === fingerprint) {
+    next.analysis = cached.analysis;
     next.phase = "ready";
+    emit();
+    return;
+  }
+  const imagePath = path.join(tempDirectory, `${id}-${randomUUID()}.png`);
+  try {
+    await writeFile(imagePath, image, { mode: 0o600 });
+    const ocr = cached ? { text: cached.text } : await native("ocr", imagePath);
+    if (job.signal.aborted || capture?.id !== id) return;
+    next.ocrText = ocr.text;
+    next.phase = "classifying";
     emit();
     next.analysis = await analyzeCapture(
       next,
-      AbortSignal.any([job.signal, AbortSignal.timeout(20000)]),
+      AbortSignal.any([job.signal, AbortSignal.timeout(30000)]),
+      (progress) => {
+        if (!job.signal.aborted && capture?.id === id) {
+          next.analysis = progress;
+          emit();
+        }
+      },
     );
+    if (!job.signal.aborted && next.analysis.source === "jev")
+      analysisCache.set(id, {
+        fingerprint,
+        analysis: next.analysis,
+        text: next.ocrText,
+      });
+    while (analysisCache.size > 100)
+      analysisCache.delete(analysisCache.keys().next().value!);
   } catch (error) {
-    if (job.signal.aborted) return next;
-    next.analysis.warning =
-      error instanceof Error ? error.message : "Could not read this image.";
+    if (job.signal.aborted) return;
+    next.analysis = {
+      ...localAnalysis(next.ocrText),
+      warning:
+        error instanceof Error
+          ? error.message
+          : "Image classification failed. Showing local fallback.",
+    };
+  } finally {
+    await rm(imagePath, { force: true }).catch(() => {});
   }
-  if (capture?.id === next.id) {
+  if (!job.signal.aborted && capture?.id === id) {
     next.phase = "ready";
     emit();
   }
-  return next;
 }
-async function readClipboard(): Promise<Capture> {
-  const items = await clipboard.read();
-  for (const item of items) {
-    const type = item.types.find((t) =>
-      ["image/png", "image/jpeg", "image/tiff"].includes(t),
-    );
-    if (type) {
-      const blob = await item.getType(type);
-      if (!(blob instanceof Blob) || blob.size > 20 * 1024 * 1024)
-        throw new Error(
-          "The clipboard image is too large. Try a smaller screenshot.",
-        );
-      return prepareImage(
-        nativeImage.createFromBuffer(Buffer.from(await blob.arrayBuffer())),
-        "Clipboard image",
-      );
-    }
-  }
+async function smartPaste(): Promise<Capture> {
   controller?.abort();
   capture = null;
   window.webContents.send("capture", null);
-  throw new Error(
-    "No image on the clipboard. Copy an image, or press Control + Command + Shift + 4 to capture a region.",
+  const image = await clipboardImage();
+  const item = image
+    ? await storeImage(image, "Clipboard screenshot")
+    : (await history.list()).items[0];
+  if (!item) {
+    capture = null;
+    window.webContents.send("capture", null);
+    throw new Error(
+      "No screenshots yet. Capture with your screenshot shortcut, copy an image, or add an image to history.",
+    );
+  }
+  await selectHistory(item.id);
+  return capture!;
+}
+async function captureRegion(reopen = false): Promise<HistoryItem | null> {
+  if (screenshotActive) throw new Error("Finish the current screenshot first.");
+  screenshotActive = true;
+  await rememberDestination();
+  window.hide();
+  const imagePath = path.join(tempDirectory, `screen-${randomUUID()}.png`);
+  try {
+    try {
+      await exec("/usr/sbin/screencapture", ["-i", "-x", "-o", imagePath], {
+        timeout: 120000,
+      });
+    } catch {
+      if (systemPreferences.getMediaAccessStatus("screen") !== "granted")
+        throw new Error(
+          "Capture needs Screen Recording permission. Copy an existing screenshot or import an image instead.",
+        );
+      return null; // Escape cancels the native region selector.
+    }
+    let bytes: Buffer;
+    try {
+      bytes = await readFile(imagePath);
+    } catch {
+      return null;
+    }
+    // Capture now, classify later. No OCR, Jev, or GPT call happens here.
+    return await storeImage(
+      nativeImage.createFromBuffer(bytes),
+      `Screenshot · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`,
+    );
+  } finally {
+    screenshotActive = false;
+    await rm(imagePath, { force: true });
+    if (reopen) positionPanel(false);
+  }
+}
+function configureWatcher() {
+  watcher?.kill();
+  watcher = null;
+  if (!getSettings().watchClipboard) return;
+  let checking = false;
+  const child = spawn(helper(), ["watch-clipboard"], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  watcher = child;
+  const lines = createInterface({ input: child.stdout! });
+  lines.on("line", async (line) => {
+    if (checking || quitting) return;
+    try {
+      if (!JSON.parse(line).imageChanged) return;
+      checking = true;
+      const image = await clipboardImage();
+      if (image) await storeImage(image, "Clipboard screenshot");
+    } catch {
+      /* Never expose clipboard contents in logs or interrupt the user. */
+    } finally {
+      checking = false;
+    }
+  });
+  child.on("error", () =>
+    notice(
+      "Clipboard image capture could not start. Your screenshot shortcut and manual import still work.",
+    ),
   );
 }
-function registerShortcut(shortcut: string): boolean {
+function registerShortcut(
+  shortcut: string,
+  kind: "paste" | "capture" = "paste",
+): boolean {
   try {
     return globalShortcut.register(shortcut, () => {
-      void showPanel(true);
+      if (kind === "capture")
+        void captureRegion().catch((error) => notice(error.message));
+      else void showPanel(true);
     });
   } catch {
     return false;
@@ -206,95 +347,86 @@ function handle(channel: string, fn: (...args: any[]) => any) {
 }
 function setupIPC() {
   handle("settings:get", getSettings);
-  handle("settings:save", (update: SettingsUpdate) => {
+  handle("settings:save", async (update: SettingsUpdate) => {
     validateSettings(update);
-    const old = getSettings().shortcut;
-    if (old !== update.shortcut && !registerShortcut(update.shortcut))
+    const previous = getSettings();
+    globalShortcut.unregister(previous.shortcut);
+    globalShortcut.unregister(previous.captureShortcut);
+    if (
+      !registerShortcut(update.shortcut) ||
+      !registerShortcut(update.captureShortcut, "capture")
+    ) {
+      globalShortcut.unregister(update.shortcut);
+      globalShortcut.unregister(update.captureShortcut);
+      registerShortcut(previous.shortcut);
+      registerShortcut(previous.captureShortcut, "capture");
       throw new Error(
-        "That shortcut is unavailable. Choose another combination.",
+        "A shortcut is unavailable. Choose two different, unused shortcuts.",
       );
+    }
     try {
       const result = saveSettings(update);
-      if (old !== update.shortcut) globalShortcut.unregister(old);
+      analysisCache.clear();
+      configureWatcher();
+      await history.setLimit(result.historyLimitMB * 1024 * 1024);
+      historyChanged();
+      updateTray();
       return result;
     } catch (error) {
-      if (old !== update.shortcut) globalShortcut.unregister(update.shortcut);
+      globalShortcut.unregister(update.shortcut);
+      globalShortcut.unregister(update.captureShortcut);
+      registerShortcut(previous.shortcut);
+      registerShortcut(previous.captureShortcut, "capture");
       throw error;
     }
   });
+  handle("history:list", (offset = 0) => {
+    if (!Number.isInteger(offset) || offset < 0)
+      throw new Error("Invalid history offset.");
+    return history.list(offset);
+  });
+  handle("history:select", async (id: string) => {
+    await rememberDestination();
+    positionPanel(true);
+    await selectHistory(id);
+  });
   handle("capture:get", () => capture);
-  handle("capture:clipboard", readClipboard);
+  handle("capture:clipboard", smartPaste);
   handle("capture:import", async () => {
     const picked = await dialog.showOpenDialog(window, {
-      title: "Choose a screenshot or image",
-      properties: ["openFile"],
+      title: "Add screenshots to history",
+      properties: ["openFile", "multiSelections"],
       filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg"] }],
     });
-    if (picked.canceled || !picked.filePaths[0]) return null;
-    const filePath = picked.filePaths[0];
-    if ((await stat(filePath)).size > 20 * 1024 * 1024)
-      throw new Error("Choose an image smaller than 20 MB.");
-    return prepareImage(
-      nativeImage.createFromBuffer(await readFile(filePath)),
-      path.basename(filePath),
-    );
-  });
-  handle("capture:screen", async () => {
-    await rememberDestination();
-    window.hide();
-    const imagePath = path.join(tempDirectory, `screen-${randomUUID()}.png`);
-    try {
-      await exec("/usr/sbin/screencapture", ["-i", "-x", "-o", imagePath], {
-        timeout: 120000,
-      });
-      let bytes: Buffer;
-      try {
-        bytes = await readFile(imagePath);
-      } catch {
-        return null;
+    if (picked.canceled) return null;
+    let last: HistoryItem | null = null;
+    for (const file of picked.filePaths) {
+      if ((await stat(file)).size > 20 * 1024 * 1024) {
+        notice(`${path.basename(file)} exceeds 20 MB and was skipped.`);
+        continue;
       }
-      return await prepareImage(
-        nativeImage.createFromBuffer(bytes),
-        "Screen capture",
+      last = await storeImage(
+        nativeImage.createFromBuffer(await readFile(file)),
+        path.basename(file),
       );
-    } catch {
-      if (systemPreferences.getMediaAccessStatus("screen") !== "granted")
-        throw new Error(
-          "Screen capture needs Screen Recording permission. You can also copy a screenshot or import an image.",
-        );
-      return null;
-    } finally {
-      await rm(imagePath, { force: true });
-      window.show();
-      window.focus();
     }
+    return last;
   });
-  handle("capture:example", async () => {
-    const imagePath = path.join(tempDirectory, "example-table.png");
-    await native("fixture", imagePath);
-    return prepareImage(
+  handle("capture:screen", () => captureRegion(true));
+  handle("capture:example", async (kind: string = "table") => {
+    if (!["table", "code"].includes(kind)) throw new Error("Unknown example.");
+    const imagePath = path.join(tempDirectory, `example-${kind}.png`);
+    await native("fixture", imagePath, kind);
+    return storeImage(
       nativeImage.createFromBuffer(await readFile(imagePath)),
-      "Example · pricing table",
+      kind === "code" ? "Example · pull request" : "Example · pricing table",
     );
   });
   handle("capture:analyze", async () => {
-    if (!capture) throw new Error("Capture an image first.");
-    const current = capture,
-      job = startJob();
-    current.phase = "reading";
-    emit();
-    try {
-      current.analysis = await analyzeCapture(
-        current,
-        AbortSignal.any([job.signal, AbortSignal.timeout(20000)]),
-      );
-    } finally {
-      if (capture?.id === current.id) {
-        current.phase = "ready";
-        emit();
-      }
-    }
-    return current;
+    if (!capture) throw new Error("Choose a screenshot first.");
+    analysisCache.delete(capture.id);
+    await selectHistory(capture.id);
+    return capture;
   });
   handle(
     "result:generate",
@@ -303,6 +435,21 @@ function setupIPC() {
         throw new Error("The screenshot changed. Select the action again.");
       if (!Object.hasOwn(ACTIONS, action) || typeof instruction !== "string")
         throw new Error("Invalid paste action.");
+      if (
+        action !== "text" &&
+        action !== "custom" &&
+        !capture.analysis.actions.some((a) => a.id === action)
+      )
+        throw new Error(
+          "Choose one of the actions selected for this screenshot.",
+        );
+      if (action === "text")
+        return generateOutput(
+          capture,
+          action,
+          instruction,
+          new AbortController().signal,
+        );
       const job = startJob();
       try {
         return await generateOutput(
@@ -342,11 +489,7 @@ function setupIPC() {
     controller?.abort();
   });
   handle("window:hide", () => window.hide());
-  handle("window:expand", () => {
-    window.webContents.send("window:mode", false);
-    window.setSize(1040, 760);
-    window.center();
-  });
+  handle("window:expand", () => positionPanel(false));
   handle("permissions:get", () => ({
     accessibility: systemPreferences.isTrustedAccessibilityClient(false),
     screen: systemPreferences.getMediaAccessStatus("screen"),
@@ -382,6 +525,45 @@ function trayIcon() {
   icon.setTemplateImage(true);
   return icon;
 }
+function updateTray() {
+  const settings = getSettings();
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      {
+        label: "Smart paste",
+        accelerator: settings.shortcut,
+        click: () => {
+          void showPanel(true);
+        },
+      },
+      {
+        label: "Capture screenshot",
+        accelerator: settings.captureShortcut,
+        click: () => {
+          void captureRegion().catch((error) => notice(error.message));
+        },
+      },
+      {
+        label: "Screenshot history",
+        click: () => {
+          void showPanel();
+        },
+      },
+      {
+        label: "Settings…",
+        click: () => {
+          void showPanel().then(() => window.webContents.send("settings:open"));
+        },
+      },
+      { type: "separator" },
+      {
+        label: "Quit SnapPaste",
+        accelerator: "Command+Q",
+        click: () => app.quit(),
+      },
+    ]),
+  );
+}
 if (!app.requestSingleInstanceLock()) app.quit();
 else {
   app.on("second-instance", () => {
@@ -396,6 +578,11 @@ else {
       app.quit();
       return;
     }
+    history = new HistoryStore(
+      path.join(app.getPath("userData"), "screenshots"),
+      getSettings().historyLimitMB * 1024 * 1024,
+    );
+    await history.open();
     tempDirectory = await mkdtemp(path.join(tmpdir(), "snappaste-"));
     window = new BrowserWindow({
       width: 1040,
@@ -423,40 +610,13 @@ else {
     });
     setupIPC();
     const settings = getSettings();
-    const shortcutOk = registerShortcut(settings.shortcut);
+    const shortcutOk =
+      registerShortcut(settings.shortcut) &&
+      registerShortcut(settings.captureShortcut, "capture");
     tray = new Tray(trayIcon());
     tray.setToolTip("SnapPaste — capture what you see, paste what you need.");
-    tray.setContextMenu(
-      Menu.buildFromTemplate([
-        {
-          label: "Smart paste from clipboard",
-          accelerator: settings.shortcut,
-          click: () => {
-            void showPanel(true);
-          },
-        },
-        {
-          label: "Open SnapPaste",
-          click: () => {
-            void showPanel();
-          },
-        },
-        {
-          label: "Settings…",
-          click: () => {
-            void showPanel().then(() =>
-              window.webContents.send("settings:open"),
-            );
-          },
-        },
-        { type: "separator" },
-        {
-          label: "Quit SnapPaste",
-          accelerator: "Command+Q",
-          click: () => app.quit(),
-        },
-      ]),
-    );
+    updateTray();
+    configureWatcher();
     Menu.setApplicationMenu(
       Menu.buildFromTemplate([
         {
@@ -465,9 +625,15 @@ else {
             { role: "about" },
             { type: "separator" },
             {
-              label: "Smart paste from clipboard",
+              label: "Smart paste",
               click: () => {
                 void showPanel(true);
+              },
+            },
+            {
+              label: "Capture screenshot",
+              click: () => {
+                void captureRegion().catch((error) => notice(error.message));
               },
             },
             {
@@ -513,7 +679,7 @@ else {
         "The smart-paste shortcut is already in use. Choose another in Settings.",
       );
     app.on("activate", () => {
-      void showPanel();
+      if (!window.isVisible()) void showPanel();
     });
   });
 }
@@ -523,6 +689,7 @@ app.on("before-quit", (event) => {
   quitting = true;
   controller?.abort();
   globalShortcut.unregisterAll();
+  watcher?.kill();
   const cleanup = tempDirectory
     ? rm(tempDirectory, { recursive: true, force: true })
     : Promise.resolve();

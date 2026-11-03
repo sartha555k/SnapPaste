@@ -5,6 +5,9 @@ import type { Settings, SettingsUpdate } from "../shared/types";
 
 interface Stored {
   shortcut: string;
+  captureShortcut: string;
+  watchClipboard: boolean;
+  historyLimitMB: number;
   openaiModel: string;
   jevModel: string;
   cloudEnabled: boolean;
@@ -14,6 +17,9 @@ interface Stored {
 }
 const defaults: Stored = {
   shortcut: "CommandOrControl+Alt+V",
+  captureShortcut: "CommandOrControl+Alt+S",
+  watchClipboard: false,
+  historyLimitMB: 200,
   openaiModel: "gpt-4.1-mini",
   jevModel: "jev-1.14.0",
   cloudEnabled: false,
@@ -49,6 +55,9 @@ export function getSettings(): Settings {
   const s = read();
   return {
     shortcut: s.shortcut,
+    captureShortcut: s.captureShortcut,
+    watchClipboard: s.watchClipboard,
+    historyLimitMB: s.historyLimitMB,
     openaiModel: s.openaiModel,
     jevModel: s.jevModel,
     cloudEnabled: s.cloudEnabled,
@@ -60,6 +69,13 @@ export function getSettings(): Settings {
 export function validateSettings(update: SettingsUpdate): void {
   if (
     !update ||
+    typeof update.captureShortcut !== "string" ||
+    !update.captureShortcut.trim() ||
+    update.captureShortcut === update.shortcut ||
+    typeof update.watchClipboard !== "boolean" ||
+    !Number.isFinite(update.historyLimitMB) ||
+    update.historyLimitMB < 50 ||
+    update.historyLimitMB > 2000 ||
     typeof update.shortcut !== "string" ||
     !update.shortcut.trim() ||
     typeof update.openaiModel !== "string" ||
@@ -96,6 +112,9 @@ export function saveSettings(update: SettingsUpdate): Settings {
   const next: Stored = {
     ...current,
     shortcut: update.shortcut,
+    captureShortcut: update.captureShortcut,
+    watchClipboard: update.watchClipboard,
+    historyLimitMB: update.historyLimitMB,
     openaiModel: update.openaiModel.trim(),
     jevModel: update.jevModel.trim(),
     cloudEnabled: update.cloudEnabled,

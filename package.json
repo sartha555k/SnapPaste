@@ -1,7 +1,7 @@
 {
   "name": "snappaste",
   "productName": "SnapPaste",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Capture what you see. Paste what you need.",
   "private": true,
   "type": "module",

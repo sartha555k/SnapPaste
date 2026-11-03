@@ -76,7 +76,7 @@ test("reject inconsistent or invalid model tables before they reach clipboard", 
     [[""]],
   );
 });
-test("action selection excludes invalid scores, duplicates, and fixed actions", () => {
+test("action selection scopes rankings to the category and keeps only text fixed", () => {
   const actions = chooseContextActions("table", {
     text: 1,
     formatted: 1,
@@ -87,7 +87,7 @@ test("action selection excludes invalid scores, duplicates, and fixed actions", 
   });
   assert.deepEqual(
     actions.map((a) => a.id),
-    ["text", "formatted", "spreadsheet", "summary"],
+    ["text", "spreadsheet", "table-markdown", "table-json"],
   );
   assert.equal(
     new Set(chooseContextActions("unknown", {}).map((a) => a.id)).size,

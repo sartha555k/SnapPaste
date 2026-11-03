@@ -1,15 +1,12 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import {
-  ArrowDownLeft,
   ArrowLeft,
   ArrowRight,
   Check,
-  ChevronDown,
   Clipboard,
   ClipboardPaste,
   Code2,
-  Command,
   Copy,
   FileText,
   ImagePlus,
@@ -18,46 +15,41 @@ import {
   LockKeyhole,
   Maximize2,
   MessageSquare,
-  Monitor,
   Scan,
   Settings2,
   ShieldCheck,
   Sparkles,
   Table2,
-  WandSparkles,
   X,
   Zap,
+  Calendar,
+  ChartNoAxesCombined,
+  PanelsTopLeft,
 } from "lucide-react";
-import { ACTIONS } from "../shared/actions";
+import { ACTIONS, CATEGORIES } from "../shared/actions";
 import type {
   ActionId,
   Capture,
+  HistoryPage,
+  PasteAction,
   PasteResult,
   Permissions,
   Settings,
   SettingsUpdate,
 } from "../shared/types";
 import "./styles.css";
-
 const api = window.snapPaste;
-const icons: Record<ActionId, typeof FileText> = {
+const icons: Record<PasteAction["icon"], typeof FileText> = {
   text: FileText,
-  formatted: WandSparkles,
-  spreadsheet: Table2,
-  summary: LayoutGrid,
-  "bug-report": Code2,
+  table: Table2,
+  code: Code2,
   message: MessageSquare,
   receipt: Clipboard,
-  event: LayoutGrid,
-  custom: Sparkles,
-};
-const categoryNames = {
-  table: "Table detected",
-  code: "Developer content",
-  receipt: "Receipt detected",
-  event: "Event detected",
-  document: "Text detected",
-  unknown: "Image ready",
+  calendar: Calendar,
+  chart: ChartNoAxesCombined,
+  design: PanelsTopLeft,
+  summary: LayoutGrid,
+  sparkles: Sparkles,
 };
 function errorMessage(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).replace(
@@ -75,664 +67,702 @@ function prettyShortcut(value: string) {
     .split("+")
     .join(" ");
 }
+const megabytes = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 
 export default function App() {
-  const [capture, setCapture] = useState<Capture | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [history, setHistory] = useState<HistoryPage | null>(null);
+  const [capture, setCapture] = useState<Capture | null>(null);
+  const [compact, setCompact] = useState(false);
+  const [picker, setPicker] = useState(false);
   const [result, setResult] = useState<PasteResult | null>(null);
-  const [activeAction, setActiveAction] = useState<ActionId | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
+  const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [toast, setToast] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [customOpen, setCustomOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [custom, setCustom] = useState(false);
   const [instruction, setInstruction] = useState("");
-  const [raw, setRaw] = useState(false);
-  const [compact, setCompact] = useState(false);
-  const captureRef = useRef<Capture | null>(null);
   const operation = useRef(0);
-  const updateCapture = useCallback((value: Capture | null) => {
-    if (!value || captureRef.current?.id !== value.id) {
+  const currentCapture = useRef<Capture | null>(null);
+  const refreshHistory = useCallback(
+    async () => setHistory(await api.listHistory()),
+    [],
+  );
+  const receiveCapture = useCallback((value: Capture | null) => {
+    if (
+      !value ||
+      value.id !== currentCapture.current?.id ||
+      value.phase === "reading"
+    ) {
       operation.current++;
       setResult(null);
-      setActiveAction(null);
-      setCustomOpen(false);
-      setBusy(null);
+      setBusy("");
+      setEditing(false);
+      setCustom(false);
+      setError("");
     }
-    captureRef.current = value;
-    setCapture(value ? { ...value } : null);
+    currentCapture.current = value;
+    setCapture(value);
   }, []);
   useEffect(() => {
-    if (!api) {
-      setError(
-        "Open SnapPaste as a desktop app with npm start. Clipboard and native features are available in the desktop app.",
-      );
-      return;
-    }
     void api
       .getSettings()
       .then(setSettings)
       .catch((e) => setError(errorMessage(e)));
-    void api.getCapture().then((value) => {
-      if (value) updateCapture(value);
-    });
-    const stops = [
-      api.onCapture(updateCapture),
+    void api.getCapture().then(receiveCapture);
+    void refreshHistory().catch((e) => setError(errorMessage(e)));
+    const off = [
+      api.onCapture(receiveCapture),
+      api.onHistory(() => {
+        void refreshHistory().catch((e) => setError(errorMessage(e)));
+      }),
       api.onNotice(setError),
       api.onSettings(() => setSettingsOpen(true)),
-      api.onMode(setCompact),
+      api.onMode((value) => {
+        operation.current++;
+        setCompact(value);
+        setPicker(false);
+        setResult(null);
+        setBusy("");
+        setError("");
+        setCustom(false);
+      }),
     ];
-    return () => stops.forEach((stop) => stop());
-  }, [updateCapture]);
+    return () => off.forEach((unsubscribe) => unsubscribe());
+  }, [receiveCapture, refreshHistory]);
   useEffect(() => {
-    if (toast) {
-      const timer = setTimeout(() => setToast(""), 2800);
-      return () => clearTimeout(timer);
-    }
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(""), 2500);
+    return () => clearTimeout(timer);
   }, [toast]);
-  async function load(kind: "clipboard" | "import" | "screen" | "example") {
+  async function add(kind: "screen" | "import" | "table" | "code") {
     setError("");
-    setBusy("Opening image");
     try {
-      await {
-        clipboard: api.readClipboard,
-        import: api.importImage,
-        screen: api.captureScreen,
-        example: api.loadExample,
-      }[kind]();
+      if (kind === "screen") await api.captureScreen();
+      else if (kind === "import") await api.importImage();
+      else await api.loadExample(kind);
+      await refreshHistory();
     } catch (e) {
       setError(errorMessage(e));
-    } finally {
-      setBusy((current) => (current === "Opening image" ? null : current));
     }
   }
-  async function run(action: ActionId, customInstruction = "") {
-    if (!capture) return;
-    if (action === "custom" && !customInstruction.trim()) {
-      setCustomOpen(true);
+  async function select(id: string) {
+    setError("");
+    setPicker(false);
+    try {
+      await api.selectHistory(id);
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  }
+  async function run(id: ActionId, prompt = "") {
+    if (!capture || capture.phase === "reading" || busy) return;
+    if (id === "custom" && !prompt.trim()) {
+      setCustom(true);
       return;
     }
-    if (
-      ACTIONS[action].cloud &&
-      (!settings?.cloudEnabled || !settings.hasOpenAIKey)
-    ) {
-      setError(
-        "Add your OpenAI key and enable cloud processing to use AI actions. Just the text works without a key.",
-      );
-      setSettingsOpen(true);
-      return;
-    }
-    const job = ++operation.current;
-    setActiveAction(action);
+    const op = ++operation.current;
     setBusy(
-      action === "text" ? "Reading text on your Mac" : "Preparing your result",
+      id === "text"
+        ? "Reading local text"
+        : `Creating ${ACTIONS[id].title.toLowerCase()}`,
     );
     setError("");
-    setRaw(false);
     try {
-      const value = await api.generate(capture.id, action, customInstruction);
-      if (job === operation.current) {
-        setResult(value);
-        setCustomOpen(false);
+      const output = await api.generate(capture.id, id, prompt);
+      if (operation.current === op) {
+        setResult(output);
+        setEditing(false);
+        setCustom(false);
       }
     } catch (e) {
-      if (job === operation.current) setError(errorMessage(e));
+      if (operation.current === op) setError(errorMessage(e));
     } finally {
-      if (job === operation.current) setBusy(null);
+      if (operation.current === op) setBusy("");
     }
-  }
-  async function cancel() {
-    operation.current++;
-    await api.cancel();
-    setBusy(null);
   }
   async function transfer(paste: boolean) {
     if (!result) return;
     try {
-      setError("");
-      await (paste ? api.paste(result) : api.copy(result));
-      setToast(paste ? "Paste sent to your app" : "Copied. Ready to paste.");
+      if (paste) await api.paste(result);
+      else {
+        await api.copy(result);
+        setToast("Copied. Ready to paste.");
+      }
     } catch (e) {
       setError(errorMessage(e));
     }
   }
+  async function cancel() {
+    operation.current++;
+    setBusy("");
+    await api.cancel();
+  }
   useEffect(() => {
-    const handleKey = (event: KeyboardEvent) => {
-      if (settingsOpen) return;
-      const editing =
-        event.target instanceof HTMLInputElement ||
-        event.target instanceof HTMLTextAreaElement ||
-        (event.target instanceof HTMLElement && event.target.isContentEditable);
-      if (event.key === "Escape") {
-        if (busy) void cancel();
-        else if (result) setResult(null);
-        else if (customOpen) setCustomOpen(false);
-        else void api?.hide();
+    const onKey = (e: KeyboardEvent) => {
+      if (
+        settingsOpen ||
+        ["INPUT", "TEXTAREA", "SELECT"].includes(
+          (e.target as HTMLElement).tagName,
+        ) ||
+        e.isComposing
+      )
+        return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        if (result) setResult(null);
+        else void api.hide();
       }
-      if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && result) {
-        event.preventDefault();
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && result) {
+        e.preventDefault();
         void transfer(true);
       }
       if (
-        !editing &&
-        !busy &&
+        compact &&
+        !picker &&
         !result &&
-        capture?.phase === "ready" &&
-        /^[1-4]$/.test(event.key)
+        !busy &&
+        !custom &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        /^[1-4]$/.test(e.key)
       ) {
-        event.preventDefault();
-        const action = capture.analysis.actions[Number(event.key) - 1];
-        if (action) void run(action.id);
+        const action = capture?.analysis.actions[Number(e.key) - 1];
+        if (action) {
+          e.preventDefault();
+          void run(action.id);
+        }
       }
     };
-    window.addEventListener("keydown", handleKey);
-    return () => window.removeEventListener("keydown", handleKey);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   });
-  const isReading = capture?.phase === "reading";
-  const actions = capture?.analysis.actions ?? [
-    ACTIONS.text,
-    ACTIONS.formatted,
-    ACTIONS.spreadsheet,
-    ACTIONS.custom,
-  ];
-
+  const actions = capture?.analysis.actions ?? [];
+  const classifying = !!capture && capture.phase !== "ready";
+  const stage =
+    capture?.phase === "reading"
+      ? "Reading text locally…"
+      : capture?.analysis.stage === "ranking"
+        ? "Jev is choosing the best three actions…"
+        : "Jev is recognizing this screenshot…";
+  const historyCards = history?.items.map((item) => (
+    <button
+      className="history-card"
+      key={item.id}
+      onClick={() => void select(item.id)}
+      aria-label={`Choose ${item.name}`}
+    >
+      <div className="history-image">
+        <img src={item.thumbnail} alt="" />
+      </div>
+      <strong>{item.name}</strong>
+      <span>
+        {item.width} × {item.height}{" "}
+        <span>
+          ·{" "}
+          {new Date(item.createdAt).toLocaleDateString([], {
+            month: "short",
+            day: "numeric",
+          })}
+        </span>
+      </span>
+      <div className="card-action">
+        Choose paste actions <ArrowRight size={13} />
+      </div>
+    </button>
+  ));
   return (
     <div className={`app-shell ${compact ? "compact" : ""}`}>
       <header className="titlebar">
         <div className="brand">
           <span className="brand-mark">
-            <ClipboardPaste size={18} />
+            <ClipboardPaste size={17} />
           </span>
-          <span>
-            SnapPaste<span className="beta">BETA</span>
-          </span>
+          SnapPaste <span className="beta">BETA</span>
         </div>
         <div className="header-tools">
-          <span className="shortcut-label">
-            Smart paste{" "}
-            <kbd>
-              {prettyShortcut(settings?.shortcut ?? "CommandOrControl+Alt+V")}
-            </kbd>
-          </span>
-          {compact && (
+          {compact ? (
             <button
               className="icon-button"
-              aria-label="Expand workspace"
-              title="Expand workspace"
+              aria-label="Open screenshot history"
               onClick={() => void api.expand()}
             >
-              <Maximize2 size={15} />
+              <Maximize2 size={16} />
             </button>
+          ) : (
+            settings && (
+              <span className="shortcut-label">
+                Smart paste <kbd>{prettyShortcut(settings.shortcut)}</kbd>
+              </span>
+            )
           )}
           <button
             className="icon-button"
-            aria-label="Open settings"
-            title="Settings"
+            aria-label="Settings"
             onClick={() => setSettingsOpen(true)}
           >
             <Settings2 size={17} />
           </button>
         </div>
       </header>
-      <main>
-        <section className="intro">
-          <div>
-            <div className="eyebrow">
-              <span className="tiny-dot" /> A LITTLE LESS COPY. A LOT MORE
-              PASTE.
+      {error && (
+        <div className="notice error" role="alert">
+          <span>{error}</span>
+          <button
+            className="icon-button"
+            aria-label="Dismiss error"
+            onClick={() => setError("")}
+          >
+            <X size={13} />
+          </button>
+        </div>
+      )}
+      {!compact ? (
+        <main className="library">
+          <section className="library-heading">
+            <div>
+              <div className="eyebrow">
+                <span className="tiny-dot" /> CAPTURE NOW. DECIDE AT PASTE.
+              </div>
+              <h1>
+                Your screenshots, <span>ready for more.</span>
+              </h1>
+              <p>
+                Keep capturing. When you’re ready to paste, choose what the
+                image becomes.
+              </p>
             </div>
-            <h1>
-              Your screenshot. <span>Your next step.</span>
-            </h1>
-            <p>Capture what you see. Paste what you need.</p>
-          </div>
-          <span className="version-chip">
-            MADE FOR MAC <Command size={12} />
-          </span>
-        </section>
-        {error && (
-          <div className="notice error" role="alert">
-            <span>{error}</span>
-            <button aria-label="Dismiss error" onClick={() => setError("")}>
-              <X size={14} />
-            </button>
-          </div>
-        )}
-        {capture?.analysis.warning && !error && (
-          <div className="notice warning" role="status">
-            <span>{capture.analysis.warning}</span>
-          </div>
-        )}
-        {compact && (
-          <div className="compact-source">
-            {capture ? (
-              <>
-                <img src={capture.dataUrl} alt="Current screenshot" />
-                <div>
-                  <strong>{capture.name}</strong>
-                  <span>
-                    {isReading
-                      ? "Reading screenshot…"
-                      : categoryNames[capture.analysis.category]}{" "}
-                    ·{" "}
-                    {capture.analysis.source === "jev" ? "Jev" : "Local rules"}
-                  </span>
-                </div>
-              </>
-            ) : (
-              <>
-                <Clipboard size={20} />
-                <div>
-                  <strong>Copy an image to get started</strong>
-                  <span>Then invoke smart paste again.</span>
-                </div>
-              </>
-            )}
             <button
-              className="icon-button"
-              aria-label="Import a different image"
-              onClick={() => void load("import")}
+              className="primary-button"
+              onClick={() => void add("screen")}
             >
-              <ImagePlus size={16} />
+              <Scan size={16} /> Capture a region{" "}
+              {settings && (
+                <kbd>{prettyShortcut(settings.captureShortcut)}</kbd>
+              )}
             </button>
-          </div>
-        )}
-        <div className="workspace">
-          <section className="source-panel">
-            <div className="panel-heading">
-              <span>
-                <span className="step-number">01</span> THE SOURCE
-              </span>
-              {capture && (
-                <button
-                  className="text-button"
-                  disabled={!!busy || isReading}
-                  onClick={() => void load("import")}
-                >
-                  Replace <ImagePlus size={13} />
-                </button>
-              )}
-            </div>
-            <div className={`image-stage ${capture ? "has-image" : ""}`}>
-              {capture ? (
-                <>
-                  <div className="image-surface">
-                    <img src={capture.dataUrl} alt={capture.name} />
-                  </div>
-                  <span className="image-dimension">
-                    {capture.width} × {capture.height}
-                  </span>
-                </>
-              ) : (
-                <div className="empty-source">
-                  <div className="capture-art">
-                    <div className="art-card back" />
-                    <div className="art-card front">
-                      <span />
-                      <span />
-                      <span />
-                      <div className="art-cursor">
-                        <ArrowDownLeft size={20} />
-                      </div>
-                    </div>
-                    <span className="scan-corner tl" />
-                    <span className="scan-corner tr" />
-                    <span className="scan-corner bl" />
-                    <span className="scan-corner br" />
-                  </div>
-                  <h2>Start with something you see.</h2>
-                  <p>
-                    A table. An error. A tiny detail.
-                    <br />
-                    We’ll help you get it out of the image.
-                  </p>
-                  <button
-                    className="primary-button"
-                    disabled={!!busy}
-                    onClick={() => void load("clipboard")}
-                  >
-                    <Clipboard size={16} /> Use clipboard image
-                  </button>
-                  <button
-                    className="text-button example-button"
-                    disabled={!!busy}
-                    onClick={() => void load("example")}
-                  >
-                    Or try an example <ArrowRight size={13} />
-                  </button>
-                </div>
-              )}
-            </div>
-            <div className="source-bottom">
-              {capture ? (
-                <>
-                  <div className="file-info">
-                    <div className="file-icon">
-                      <ImagePlus size={16} />
-                    </div>
-                    <div>
-                      <strong title={capture.name}>{capture.name}</strong>
-                      <span>PNG · {(capture.bytes / 1024).toFixed(0)} KB</span>
-                    </div>
-                    {isReading ? (
-                      <LoaderCircle className="spin muted" size={15} />
-                    ) : (
-                      <Check className="green" size={16} />
-                    )}
-                  </div>
-                  <div className="detection">
-                    <span>
-                      <span
-                        className={`tiny-dot ${isReading ? "pulse" : ""}`}
-                      />
-                      {isReading
-                        ? "Reading your screenshot…"
-                        : categoryNames[capture.analysis.category]}
-                    </span>
-                    <span className="source-label">
-                      {capture.analysis.source === "jev"
-                        ? "JEV · EXPERIMENTAL"
-                        : "LOCAL RULES"}
-                    </span>
-                  </div>
-                </>
-              ) : (
-                <div className="capture-hint">
-                  <Scan size={15} />
-                  <span>
-                    Copy a region with <kbd>⌃ ⌘ ⇧ 4</kbd>
-                  </span>
-                </div>
-              )}
-            </div>
-            <div className="source-toolbar">
-              <button
-                disabled={!!busy || isReading}
-                onClick={() => void load("screen")}
-              >
-                <Scan size={15} /> Capture region
-              </button>
-              <button
-                disabled={!!busy || isReading}
-                onClick={() => void load("import")}
-              >
-                <ImagePlus size={15} /> Open image
-              </button>
-              {capture && (
-                <button
-                  title="Read a new clipboard image"
-                  aria-label="Read clipboard image"
-                  disabled={!!busy || isReading}
-                  onClick={() => void load("clipboard")}
-                >
-                  <Clipboard size={15} />
-                </button>
-              )}
-            </div>
           </section>
-          <section className="destination-panel">
-            <div className="panel-heading">
+          <div className="workflow-strip">
+            <div>
+              <span className="step-number">1</span>
               <span>
-                <span className="step-number">02</span>{" "}
-                {result ? "YOUR RESULT" : "MAKE IT USEFUL"}
-              </span>
-              <span className="subtle-label">
-                {result ? "CHECK · EDIT · PASTE" : "FOUR WAYS FORWARD"}
+                <strong>Capture freely</strong>
+                <small>Screenshots stay on this Mac.</small>
               </span>
             </div>
-            {result ? (
-              <div className="result-view">
-                <div className="result-heading">
+            <ArrowRight size={16} />
+            <div>
+              <span className="step-number">2</span>
+              <span>
+                <strong>
+                  Press{" "}
+                  {settings
+                    ? prettyShortcut(settings.shortcut)
+                    : "your shortcut"}
+                </strong>
+                <small>Jev chooses relevant paste actions.</small>
+              </span>
+            </div>
+            <ArrowRight size={16} />
+            <div>
+              <span className="step-number">3</span>
+              <span>
+                <strong>Pick, review, paste</strong>
+                <small>Local text or a specific AI task.</small>
+              </span>
+            </div>
+          </div>
+          <div className="library-toolbar">
+            <h2>
+              Screenshot history <span>{history?.total ?? 0}</span>
+            </h2>
+            <div>
+              <button className="text-button" onClick={() => void add("table")}>
+                Try a table
+              </button>
+              <button className="text-button" onClick={() => void add("code")}>
+                Try a pull request
+              </button>
+              <button
+                className="secondary-button small"
+                onClick={() => void add("import")}
+              >
+                <ImagePlus size={14} /> Add images
+              </button>
+            </div>
+          </div>
+          <div className="library-scroll">
+            {history?.total ? (
+              <div className="history-grid">{historyCards}</div>
+            ) : (
+              <div className="library-empty">
+                <div className="empty-stack">
+                  <Scan size={30} />
+                </div>
+                <h2>Many screenshots. Four useful choices.</h2>
+                <p>
+                  Capture a region or add images. Your paste menu changes with
+                  the content—not a fixed set of buttons.
+                </p>
+                <button
+                  className="secondary-button"
+                  onClick={() => void add("import")}
+                >
+                  <ImagePlus size={15} /> Add your first screenshots
+                </button>
+                <small>
+                  You can also try the example table and pull request above.
+                </small>
+              </div>
+            )}
+            {history?.hasMore && (
+              <button
+                className="load-more secondary-button"
+                onClick={() =>
+                  void api
+                    .listHistory(history.items.length)
+                    .then((page) =>
+                      setHistory({
+                        ...page,
+                        items: [...history.items, ...page.items],
+                      }),
+                    )
+                    .catch((e) => setError(errorMessage(e)))
+                }
+              >
+                Load older screenshots
+              </button>
+            )}
+          </div>
+          <div className="library-bottom">
+            <span>
+              {history
+                ? `${megabytes(history.bytes)} of ${megabytes(history.limitBytes)} used`
+                : "Local screenshot storage"}{" "}
+              · oldest captures expire when full
+            </span>
+            <span>No AI call when you capture</span>
+          </div>
+        </main>
+      ) : (
+        <main className="paste-main">
+          {picker ? (
+            <>
+              <div className="picker-heading">
+                <button
+                  className="icon-button"
+                  aria-label="Back to paste options"
+                  onClick={() => setPicker(false)}
+                >
+                  <ArrowLeft size={17} />
+                </button>
+                <h2>Choose a screenshot</h2>
+                <span>{history?.total ?? 0} saved</span>
+              </div>
+              <div className="picker-scroll">
+                <div className="history-grid">{historyCards}</div>
+                {history?.hasMore && (
                   <button
-                    className="back-button"
-                    onClick={() => setResult(null)}
+                    className="load-more secondary-button"
+                    onClick={() =>
+                      void api
+                        .listHistory(history.items.length)
+                        .then((page) =>
+                          setHistory({
+                            ...page,
+                            items: [...history.items, ...page.items],
+                          }),
+                        )
+                        .catch((e) => setError(errorMessage(e)))
+                    }
                   >
-                    <ArrowLeft size={14} /> Actions
+                    Load older screenshots
                   </button>
-                  <span className="result-source">
-                    {result.source === "Apple Vision" ? (
-                      <Monitor size={12} />
-                    ) : (
-                      <Sparkles size={12} />
-                    )}{" "}
-                    {result.source} · {(result.elapsedMs / 1000).toFixed(1)}s
-                  </span>
-                </div>
-                <div className="result-title-row">
-                  <h2>{ACTIONS[result.actionId].title}</h2>
-                  {result.kind === "text" && (
-                    <div className="segmented">
+                )}
+              </div>
+            </>
+          ) : !capture ? (
+            <div className="library-empty">
+              <Scan size={32} />
+              <h2>Choose what to paste</h2>
+              <p>Copy a screenshot, or choose one from your history.</p>
+              <button
+                className="primary-button"
+                onClick={() => setPicker(true)}
+              >
+                Open screenshot history
+              </button>
+            </div>
+          ) : (
+            <>
+              <button
+                className="paste-source"
+                onClick={() => {
+                  setPicker(true);
+                  void refreshHistory();
+                }}
+              >
+                <img src={capture.dataUrl} alt="Selected screenshot" />
+                <span>
+                  <strong>{capture.name}</strong>
+                  <small>
+                    {classifying && capture.analysis.stage !== "ranking"
+                      ? "Recognizing content"
+                      : CATEGORIES[capture.analysis.category].title}{" "}
+                    · choose another
+                  </small>
+                </span>
+                <LayoutGrid size={15} />
+              </button>
+              <div className="paste-scroll">
+                {result ? (
+                  <section className="result-view">
+                    <div className="result-heading">
                       <button
-                        className={!raw ? "selected" : ""}
-                        onClick={() => setRaw(false)}
+                        className="icon-button"
+                        aria-label="Back to paste options"
+                        onClick={() => setResult(null)}
                       >
-                        Preview
+                        <ArrowLeft size={16} />
                       </button>
-                      <button
-                        className={raw ? "selected" : ""}
-                        onClick={() => setRaw(true)}
-                      >
-                        Edit
-                      </button>
+                      <h2>{ACTIONS[result.actionId].title}</h2>
+                      {result.kind === "text" && (
+                        <button
+                          className="text-button"
+                          onClick={() => setEditing(!editing)}
+                        >
+                          {editing ? "Preview" : "Edit"}
+                        </button>
+                      )}
                     </div>
-                  )}
-                </div>
-                <div className="result-content">
-                  {result.kind === "table" ? (
-                    <div className="table-scroll">
-                      <table>
-                        <thead>
-                          <tr>
-                            {result.headers.map((cell, i) => (
-                              <th key={i}>
-                                <input
-                                  aria-label={`Column ${i + 1} heading`}
-                                  value={cell}
-                                  onChange={(e) =>
-                                    setResult({
-                                      ...result,
-                                      headers: result.headers.map((c, j) =>
-                                        j === i ? e.target.value : c,
-                                      ),
-                                    })
-                                  }
-                                />
-                              </th>
-                            ))}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {result.rows.map((row, r) => (
-                            <tr key={r}>
-                              {row.map((cell, c) => (
-                                <td key={c}>
+                    <div className="result-meta">
+                      {result.source} · {(result.elapsedMs / 1000).toFixed(1)}s
+                      · review before pasting
+                    </div>
+                    {result.kind === "table" ? (
+                      <div className="editable-table">
+                        <table>
+                          <thead>
+                            <tr>
+                              {result.headers.map((cell, col) => (
+                                <th key={col}>
                                   <input
-                                    aria-label={`Row ${r + 1} column ${c + 1}`}
+                                    aria-label={`Column ${col + 1} heading`}
                                     value={cell}
                                     onChange={(e) =>
                                       setResult({
                                         ...result,
-                                        rows: result.rows.map((old, i) =>
-                                          i === r
-                                            ? old.map((v, j) =>
-                                                j === c ? e.target.value : v,
-                                              )
-                                            : old,
+                                        headers: result.headers.map((c, i) =>
+                                          i === col ? e.target.value : c,
                                         ),
                                       })
                                     }
                                   />
-                                </td>
+                                </th>
                               ))}
                             </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  ) : raw ? (
-                    <textarea
-                      className="result-editor"
-                      aria-label="Edit extracted text"
-                      value={result.text}
-                      onChange={(e) =>
-                        setResult({ ...result, text: e.target.value })
-                      }
-                    />
-                  ) : (
-                    <div className="markdown">
-                      {result.actionId === "text" ? (
-                        <pre className="plain-text">{result.text}</pre>
-                      ) : (
-                        <ReactMarkdown
-                          skipHtml
-                          components={{
-                            a: ({ children }) => <span>{children}</span>,
-                          }}
-                        >
-                          {result.text}
-                        </ReactMarkdown>
-                      )}
-                    </div>
-                  )}
-                </div>
-                {result.notes.length > 0 && (
-                  <div className="result-notes">
-                    <strong>Worth checking</strong>
-                    {result.notes.map((note, i) => (
-                      <p key={i}>{note}</p>
-                    ))}
-                  </div>
-                )}
-                <div className="result-caption">
-                  {result.kind === "table"
-                    ? "Click any cell to edit. Copies as spreadsheet cells and a formatted table."
-                    : "Review before pasting. Use Edit to make it yours."}
-                </div>
-                <div className="result-buttons">
-                  <button
-                    className="secondary-button"
-                    onClick={() => void transfer(false)}
-                  >
-                    <Copy size={15} /> Copy
-                  </button>
-                  <button
-                    className="primary-button"
-                    onClick={() => void transfer(true)}
-                  >
-                    <ClipboardPaste size={15} /> Paste into app <kbd>⌘ ↵</kbd>
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <div className="actions-view">
-                <div className="actions-intro">
-                  <h2>How would you like to paste?</h2>
-                  <p>
-                    {capture
-                      ? "Same screenshot. A more useful format."
-                      : "Your image becomes something you can work with."}
-                  </p>
-                </div>
-                <div className={`action-list ${!capture ? "waiting" : ""}`}>
-                  {actions.map((action, index) => {
-                    const Icon = icons[action.id];
-                    return (
+                          </thead>
+                          <tbody>
+                            {result.rows.map((row, r) => (
+                              <tr key={r}>
+                                {row.map((cell, c) => (
+                                  <td key={c}>
+                                    <input
+                                      aria-label={`Row ${r + 1} column ${c + 1}`}
+                                      value={cell}
+                                      onChange={(e) =>
+                                        setResult({
+                                          ...result,
+                                          rows: result.rows.map((old, i) =>
+                                            i === r
+                                              ? old.map((v, j) =>
+                                                  j === c ? e.target.value : v,
+                                                )
+                                              : old,
+                                          ),
+                                        })
+                                      }
+                                    />
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : editing ? (
+                      <textarea
+                        className="result-editor"
+                        aria-label="Edit paste result"
+                        value={result.text}
+                        onChange={(e) =>
+                          setResult({ ...result, text: e.target.value })
+                        }
+                      />
+                    ) : (
+                      <div className="markdown">
+                        {result.actionId === "text" ? (
+                          <pre>{result.text}</pre>
+                        ) : (
+                          <ReactMarkdown
+                            skipHtml
+                            components={{
+                              a: ({ children }) => <span>{children}</span>,
+                            }}
+                          >
+                            {result.text}
+                          </ReactMarkdown>
+                        )}
+                      </div>
+                    )}
+                    {result.notes.length > 0 && (
+                      <div className="result-notes">
+                        <strong>Check these details</strong>
+                        {result.notes.map((note, i) => (
+                          <p key={i}>{note}</p>
+                        ))}
+                      </div>
+                    )}
+                    <p className="result-caption">
+                      {result.kind === "table"
+                        ? "Edit any cell. Copies as spreadsheet cells and a formatted table."
+                        : "Review the content, then copy or paste into your previous app."}
+                    </p>
+                    <div className="result-buttons">
                       <button
-                        key={action.id}
-                        className={`action-card ${activeAction === action.id && busy ? "working" : ""}`}
-                        disabled={!capture || !!busy || isReading}
-                        onClick={() => void run(action.id)}
+                        className="secondary-button"
+                        onClick={() => void transfer(false)}
                       >
-                        <span
-                          className={`action-icon ${action.id === "text" ? "local-icon" : ""}`}
-                        >
-                          <Icon size={19} />
-                        </span>
-                        <span className="action-copy">
-                          <span className="action-title">
-                            {action.title}
-                            <span
-                              className={`action-badge ${action.cloud ? "" : "local"}`}
-                            >
-                              {action.cloud ? (
-                                <Sparkles size={9} />
-                              ) : (
-                                <Zap size={9} />
-                              )}{" "}
-                              {action.badge}
-                            </span>
-                          </span>
-                          <span className="action-description">
-                            {action.description}
-                          </span>
-                        </span>
-                        <span className="action-key">{index + 1}</span>
+                        <Copy size={15} /> Copy
                       </button>
-                    );
-                  })}
-                </div>
-                {busy && capture ? (
-                  <div className="busy-row" role="status">
-                    <LoaderCircle className="spin" size={15} />
-                    <span>{busy}…</span>
-                    <button onClick={() => void cancel()}>Cancel</button>
-                  </div>
-                ) : (
-                  <>
-                    <div className="custom-divider">
-                      <span>OR MAKE IT YOURS</span>
+                      <button
+                        className="primary-button"
+                        onClick={() => void transfer(true)}
+                      >
+                        <ClipboardPaste size={15} /> Paste into app{" "}
+                        <kbd>⌘ ↵</kbd>
+                      </button>
                     </div>
-                    {customOpen ? (
+                  </section>
+                ) : (
+                  <section className="actions-view">
+                    <div className="actions-intro">
+                      <div className="eyebrow">
+                        {classifying ? (
+                          <>
+                            <LoaderCircle size={11} className="spin" />
+                            {stage}
+                          </>
+                        ) : capture.analysis.source === "jev" ? (
+                          <>
+                            <Sparkles size={11} /> JEV · CATEGORY → ACTION
+                            RANKING
+                          </>
+                        ) : (
+                          "LOCAL FALLBACK · JEV NOT USED"
+                        )}
+                      </div>
+                      <h2>How would you like to paste?</h2>
+                      <p>One local option. Three matched to this screenshot.</p>
+                    </div>
+                    <div className="action-list">
+                      {Array.from({ length: 4 }, (_, index) => {
+                        const action = actions[index];
+                        if (!action)
+                          return (
+                            <div
+                              key={`loading-${index}`}
+                              className="action-card action-loading"
+                            >
+                              <span className="skeleton-icon" />
+                              <span>
+                                <strong>Finding a useful action…</strong>
+                                <small>After the category is selected</small>
+                              </span>
+                              <span className="action-key">{index + 1}</span>
+                            </div>
+                          );
+                        const Icon = icons[action.icon];
+                        return (
+                          <button
+                            className="action-card"
+                            key={action.id}
+                            disabled={!!busy || capture.phase === "reading"}
+                            onClick={() => void run(action.id)}
+                          >
+                            <span
+                              className={`action-icon ${action.cloud ? "" : "local-icon"}`}
+                            >
+                              <Icon size={19} />
+                            </span>
+                            <span className="action-copy">
+                              <span className="action-title">
+                                {action.title}
+                                <span
+                                  className={`action-badge ${action.cloud ? "" : "local"}`}
+                                >
+                                  {action.badge}
+                                </span>
+                              </span>
+                              <span className="action-description">
+                                {action.description}
+                              </span>
+                            </span>
+                            <span className="action-key">{index + 1}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {capture.analysis.warning && (
+                      <p className="classification-warning">
+                        {capture.analysis.warning}
+                      </p>
+                    )}
+                    {busy && (
+                      <div className="busy-row" role="status">
+                        <LoaderCircle size={15} className="spin" />
+                        <span>{busy}…</span>
+                        <button
+                          className="text-button"
+                          onClick={() => void cancel()}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    )}
+                    {custom && (
                       <div className="custom-box">
                         <textarea
-                          autoFocus
                           aria-label="Custom instruction"
-                          placeholder="e.g. Extract only the product names and monthly prices"
+                          placeholder="What do you want from this screenshot?"
                           value={instruction}
                           maxLength={4000}
                           onChange={(e) => setInstruction(e.target.value)}
                         />
-                        <div>
-                          <button
-                            className="text-button"
-                            onClick={() => setCustomOpen(false)}
-                          >
-                            Cancel
-                          </button>
-                          <button
-                            className="primary-button small"
-                            disabled={!instruction.trim()}
-                            onClick={() => void run("custom", instruction)}
-                          >
-                            Create result <ArrowRight size={13} />
-                          </button>
-                        </div>
+                        <button
+                          className="primary-button small"
+                          disabled={!instruction.trim() || !!busy}
+                          onClick={() => void run("custom", instruction)}
+                        >
+                          Create result <ArrowRight size={13} />
+                        </button>
                       </div>
-                    ) : (
-                      <button
-                        className="custom-trigger"
-                        disabled={!capture || isReading}
-                        onClick={() => setCustomOpen(true)}
-                      >
-                        <span>
-                          <Sparkles size={15} /> Give a custom instruction
-                        </span>
-                        <ArrowRight size={14} />
-                      </button>
                     )}
-                    {settings && settings.prompts.length > 0 && (
+                    {!!settings?.prompts.length && (
                       <select
-                        className="prompt-select"
                         aria-label="Saved prompts"
+                        className="prompt-select"
                         value=""
-                        disabled={!capture || isReading}
+                        disabled={!!busy || capture.phase === "reading"}
                         onChange={(e) => {
                           const prompt = settings.prompts.find(
                             (p) => p.id === e.target.value,
                           );
                           if (prompt) {
                             setInstruction(prompt.instruction);
-                            setCustomOpen(true);
+                            setCustom(true);
                           }
                         }}
                       >
@@ -744,28 +774,33 @@ export default function App() {
                         ))}
                       </select>
                     )}
-                  </>
+                  </section>
                 )}
               </div>
-            )}
-          </section>
-        </div>
-      </main>
+            </>
+          )}
+        </main>
+      )}
       <footer>
         <span>
           <ShieldCheck size={13} />
-          {settings?.cloudEnabled
-            ? "Cloud processing enabled"
-            : "Local by default. AI when you choose."}
+          {compact
+            ? "OpenAI runs only after you choose an AI action"
+            : "Screenshot history stays on this Mac"}
         </span>
         <span>
-          <kbd>esc</kbd> to dismiss <span className="footer-separator">·</span>{" "}
-          <kbd>1–4</kbd> to choose
+          {compact ? (
+            <>
+              <kbd>1–4</kbd> choose · <kbd>esc</kbd> dismiss
+            </>
+          ) : (
+            "macOS · 0.2"
+          )}
         </span>
       </footer>
       {toast && (
         <div className="toast" role="status">
-          <Check size={16} />
+          <Check size={15} />
           {toast}
         </div>
       )}
@@ -776,13 +811,13 @@ export default function App() {
           onSaved={(value) => {
             setSettings(value);
             setToast("Settings saved");
+            void refreshHistory();
           }}
         />
       )}
     </div>
   );
 }
-
 function SettingsDialog({
   settings,
   onClose,
@@ -794,6 +829,9 @@ function SettingsDialog({
 }) {
   const [draft, setDraft] = useState<SettingsUpdate>({
     shortcut: settings.shortcut,
+    captureShortcut: settings.captureShortcut,
+    watchClipboard: settings.watchClipboard,
+    historyLimitMB: settings.historyLimitMB,
     openaiModel: settings.openaiModel,
     jevModel: settings.jevModel,
     cloudEnabled: settings.cloudEnabled,
@@ -883,12 +921,69 @@ function SettingsDialog({
                   Example: CommandOrControl+Alt+V. Ordinary ⌘ V keeps working.
                 </small>
               </label>
+              <label className="setting-field">
+                Screenshot shortcut
+                <input
+                  value={draft.captureShortcut}
+                  onChange={(e) =>
+                    setDraft({ ...draft, captureShortcut: e.target.value })
+                  }
+                />
+                <small>
+                  Captures a region into history. No AI processing until paste
+                  time.
+                </small>
+              </label>
+              <label className="setting-field">
+                Local history budget (MB)
+                <input
+                  type="number"
+                  min={50}
+                  max={2000}
+                  value={draft.historyLimitMB}
+                  onChange={(e) =>
+                    setDraft({
+                      ...draft,
+                      historyLimitMB: Number(e.target.value),
+                    })
+                  }
+                />
+                <small>
+                  No screenshot-count limit. Oldest captures expire when storage
+                  fills up; original files are never deleted.
+                </small>
+              </label>
+              <div className="cloud-setting">
+                <div>
+                  <strong>Save copied screenshots automatically</strong>
+                  <p>
+                    While SnapPaste runs, save new clipboard images locally. Use
+                    ⇧ ⌃ ⌘ 4 for macOS screenshots copied to the clipboard.
+                    Screenshots saved only to Desktop are not monitored.
+                  </p>
+                </div>
+                <button
+                  role="switch"
+                  aria-label="Save copied screenshots automatically"
+                  aria-checked={draft.watchClipboard}
+                  className={`toggle ${draft.watchClipboard ? "on" : ""}`}
+                  onClick={() =>
+                    setDraft({
+                      ...draft,
+                      watchClipboard: !draft.watchClipboard,
+                    })
+                  }
+                >
+                  <span />
+                </button>
+              </div>
               <div className="cloud-setting">
                 <div>
                   <strong>Enable cloud processing</strong>
                   <p>
-                    Jev receives the captured image to suggest actions. OpenAI
-                    receives it when you select an AI action.
+                    Jev receives only the screenshot you choose at paste time,
+                    first to classify it, then to rank actions. OpenAI receives
+                    it when you select an AI action.
                   </p>
                 </div>
                 <button
@@ -1036,7 +1131,7 @@ function SettingsDialog({
               </div>
               <p className="secure-note">
                 <LockKeyhole size={13} /> Keys are encrypted using macOS secure
-                storage. Screenshots are not kept in a history.
+                storage. Screenshot history is stored locally on this Mac.
               </p>
             </>
           ) : (
