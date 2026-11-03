@@ -136,6 +136,12 @@ do {
         }
     case "frontmost":
         try emit(["pid": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0])
+    case "unhide":
+        // Unhide SnapPaste without activating it, so the destination app keeps focus.
+        guard args.count == 3, let pid = Int32(args[2]), let target = NSRunningApplication(processIdentifier: pid) else { fail("Invalid unhide request.") }
+        if target.isHidden { _ = target.unhide() }
+        for _ in 0..<20 where target.isHidden { Thread.sleep(forTimeInterval: 0.01) }
+        try emit(["ok": !target.isHidden])
     case "context":
         // Everything the inline menu needs at shortcut time, in one fast call.
         let front = NSWorkspace.shared.frontmostApplication
@@ -162,18 +168,18 @@ do {
         // Never yank the user back: if they moved to another app meanwhile, leave the result on the clipboard.
         guard AXIsProcessTrusted(), front == pid || front == own, let target = NSRunningApplication(processIdentifier: pid) else {
             _ = write(text: text, html: html, transient: false, pasteboard)
-            try emit(["ok": false, "reason": AXIsProcessTrusted() ? "focus-changed" : "untrusted"])
+            try emit(["ok": false, "reason": AXIsProcessTrusted() ? "focus-changed" : "untrusted", "front": front, "frontName": NSWorkspace.shared.frontmostApplication?.localizedName ?? "", "dest": pid, "own": own])
             break
         }
         let saved = snapshot(pasteboard)
         let written = write(text: text, html: html, transient: true, pasteboard)
         if front != pid {
             target.activate(options: [])
-            for _ in 0..<40 where NSWorkspace.shared.frontmostApplication?.processIdentifier != pid { Thread.sleep(forTimeInterval: 0.025) }
+            for _ in 0..<60 where NSWorkspace.shared.frontmostApplication?.processIdentifier != pid { Thread.sleep(forTimeInterval: 0.025) }
         }
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
             pasteboard.clearContents(); _ = write(text: text, html: html, transient: false, pasteboard)
-            try emit(["ok": false, "reason": "focus-changed"]); break
+            try emit(["ok": false, "reason": "focus-changed", "stage": "after-activate", "front": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0, "frontName": NSWorkspace.shared.frontmostApplication?.localizedName ?? "", "dest": pid, "own": own, "startFront": front]); break
         }
         Thread.sleep(forTimeInterval: 0.05)
         guard sendCommandV() else { fail("Could not create the paste event.") }

@@ -220,6 +220,7 @@ function analyzeItem(
           (progress) => progressListeners.get(id)?.({ analysis: progress }),
         );
       } catch (error) {
+        console.error("[snappaste] Jev classification failed:", error);
         analysis = {
           ...localAnalysis(text),
           warning:
@@ -333,6 +334,7 @@ async function selectHistory(id: string) {
     next.analysis = entry.analysis ?? localAnalysis(entry.text);
   } catch (error) {
     if (job.signal.aborted) return;
+    console.error("[snappaste] screenshot analysis failed:", error);
     next.analysis = {
       ...localAnalysis(next.ocrText),
       warning:
@@ -544,6 +546,9 @@ async function openPalette() {
       /* Fall through to existing history. */
     }
   }
+  // After a mouse-click paste SnapPaste is hidden; a hidden app cannot show the menu.
+  if (app.isHidden())
+    await native("unhide", String(process.pid)).catch(() => {});
   const page = await history.list();
   paletteAnchor = context.anchor ?? cursorAnchor();
   paletteSize.height = 304;
@@ -563,6 +568,25 @@ async function openPalette() {
   palette.focus();
   if (page.items[0]) void selectHistory(page.items[0].id);
 }
+/**
+ * A mouse click on the menu activates SnapPaste (asynchronously, sometimes after the
+ * result is already ready), and macOS ignores a background helper's request to switch
+ * back. While SnapPaste is frontmost, hide it so macOS returns focus to the app the
+ * user was typing in, then let the helper paste there.
+ */
+async function returnFocus() {
+  for (let attempt = 0; attempt < 12; attempt++) {
+    let front = 0;
+    try {
+      front = (await native("frontmost")).pid;
+    } catch {
+      return;
+    }
+    if (front !== process.pid) return;
+    app.hide();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
 async function pasteInto(payload: { text: string; html: string }) {
   const file = path.join(tempDirectory, `paste-${randomUUID()}.json`);
   await writeFile(file, JSON.stringify(payload), { mode: 0o600 });
@@ -574,6 +598,7 @@ async function pasteInto(payload: { text: string; html: string }) {
       file,
       String(process.pid),
     );
+    console.error("[snappaste] paste outcome:", JSON.stringify(outcome));
     if (outcome.ok) return "pasted";
     notify(
       outcome.reason === "untrusted"
@@ -581,7 +606,8 @@ async function pasteInto(payload: { text: string; html: string }) {
         : "You switched apps, so the result was copied instead. Press ⌘V to paste it.",
     );
     return "copied";
-  } catch {
+  } catch (error) {
+    console.error("[snappaste] paste failed:", error);
     await clipboard.write([
       new ClipboardItem({
         "text/plain": new Blob([payload.text], { type: "text/plain" }),
@@ -746,6 +772,7 @@ function setupIPC() {
       const payload = clipboardPayload(validatePasteResult(result));
       paletteBusy = false;
       palette.hide();
+      await returnFocus();
       return await pasteInto(payload);
     } finally {
       paletteBusy = false;
