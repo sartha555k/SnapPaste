@@ -8,6 +8,7 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  Notification,
   screen,
   shell,
   systemPreferences,
@@ -33,11 +34,19 @@ import type {
 import { getSettings, saveSettings, validateSettings } from "./main/settings";
 import { analyzeCapture, generateOutput } from "./main/providers";
 import { HistoryStore } from "./main/history";
+import { placeMenu, type Placement, type Rect } from "./shared/placement";
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string;
 declare const MAIN_WINDOW_VITE_NAME: string;
 const exec = promisify(execFile);
 app.setName("SnapPaste");
+// Development only: OPENAI_API_KEY / JEV_API_KEY from the project's git-ignored env file.
+if (!app.isPackaged)
+  try {
+    process.loadEnvFile(path.join(app.getAppPath(), ".env"));
+  } catch {
+    /* No env file: keys come from Settings. */
+  }
 let window: BrowserWindow;
 let tray: Tray;
 let capture: Capture | null = null;
@@ -48,10 +57,30 @@ let tempDirectory = "";
 let history: HistoryStore;
 let watcher: ChildProcess | null = null;
 let screenshotActive = false;
-const analysisCache = new Map<
+// Inline paste menu: a non-activating panel, so the destination app keeps focus.
+let palette: BrowserWindow;
+let paletteAnchor: Rect = { x: 0, y: 0, width: 1, height: 1 };
+let palettePlacement: Placement | null = null;
+const paletteSize = { width: 360, height: 304 };
+let paletteBusy = false;
+let lastClipboardChange = -1;
+
+// OCR text and Jev analysis per screenshot, persisted so older screenshots open instantly.
+// `fingerprint` is set only for real Jev results; local fallbacks are recomputed (cheaply).
+interface CacheEntry {
+  fingerprint: string;
+  analysis: Analysis | null;
+  text: string;
+}
+const analysisCache = new Map<string, CacheEntry>();
+const inflight = new Map<string, Promise<CacheEntry>>();
+const progressListeners = new Map<
   string,
-  { fingerprint: string; analysis: Analysis; text: string }
+  (update: { text?: string; analysis?: Analysis }) => void
 >();
+let cacheFile = "";
+let cacheTimer: NodeJS.Timeout | undefined;
+let backgroundChain: Promise<unknown> = Promise.resolve();
 const helper = () =>
   app.isPackaged
     ? path.join(process.resourcesPath, "SnapPasteHelper")
@@ -63,11 +92,20 @@ async function native(command: string, ...args: string[]): Promise<any> {
   });
   return JSON.parse(stdout);
 }
+function broadcast(channel: string, ...args: unknown[]) {
+  for (const target of [window, palette])
+    if (target && !target.isDestroyed()) target.webContents.send(channel, ...args);
+}
 function notice(message: string) {
   window?.webContents.send("notice", message);
 }
+function notify(body: string) {
+  if (Notification.isSupported())
+    new Notification({ title: "SnapPaste", body, silent: true }).show();
+  else notice(body);
+}
 function emit() {
-  if (capture) window?.webContents.send("capture", capture);
+  if (capture) broadcast("capture", capture);
 }
 async function rememberDestination() {
   try {
@@ -89,7 +127,12 @@ function positionPanel(compact: boolean) {
     Math.round(workArea.x + (workArea.width - width) / 2),
     Math.round(workArea.y + Math.max(10, (workArea.height - height) / 2)),
   );
+  showMain();
+}
+function showMain() {
   window.show();
+  // With no Dock icon, the app must be brought forward explicitly.
+  app.focus({ steal: true });
   window.focus();
 }
 async function showPanel(paste = false) {
@@ -103,7 +146,108 @@ function startJob(): AbortController {
   return controller;
 }
 function historyChanged() {
-  window?.webContents.send("history:changed");
+  broadcast("history:changed");
+}
+function fingerprint() {
+  const s = getSettings();
+  return `hierarchy-v2:${s.jevModel}:${s.cloudEnabled}:${s.hasJevKey}`;
+}
+async function loadAnalysisCache() {
+  try {
+    const entries = JSON.parse(await readFile(cacheFile, "utf8"));
+    if (Array.isArray(entries))
+      for (const [id, entry] of entries)
+        if (typeof id === "string" && typeof entry?.text === "string")
+          analysisCache.set(id, entry);
+  } catch {
+    /* No cache yet. */
+  }
+}
+function remember(id: string, entry: CacheEntry) {
+  analysisCache.delete(id);
+  analysisCache.set(id, entry);
+  while (analysisCache.size > 500)
+    analysisCache.delete(analysisCache.keys().next().value!);
+  clearTimeout(cacheTimer);
+  cacheTimer = setTimeout(() => {
+    void writeFile(cacheFile, JSON.stringify([...analysisCache]), {
+      mode: 0o600,
+    }).catch(() => {});
+  }, 500);
+}
+/**
+ * OCR + Jev classification for one screenshot. Shared by background analysis (right
+ * after capture) and paste-time selection, so a screenshot is never analysed twice.
+ */
+function analyzeItem(
+  id: string,
+  png: Buffer,
+  meta: { name: string; width: number; height: number; bytes: number },
+): Promise<CacheEntry> {
+  const fp = fingerprint();
+  const cached = analysisCache.get(id);
+  if (cached?.analysis && cached.fingerprint === fp)
+    return Promise.resolve(cached);
+  const key = `${id}:${fp}`;
+  const running = inflight.get(key);
+  if (running) return running;
+  const work = (async () => {
+    const imagePath = path.join(tempDirectory, `${id}-${randomUUID()}.png`);
+    try {
+      let text = cached?.text;
+      if (text === undefined) {
+        await writeFile(imagePath, png, { mode: 0o600 });
+        text = String((await native("ocr", imagePath)).text ?? "");
+        remember(id, { fingerprint: "", analysis: null, text });
+      }
+      progressListeners.get(id)?.({ text });
+      const subject: Capture = {
+        id,
+        name: meta.name,
+        dataUrl: `data:image/png;base64,${png.toString("base64")}`,
+        width: meta.width,
+        height: meta.height,
+        bytes: meta.bytes,
+        ocrText: text,
+        analysis: localAnalysis(text),
+        phase: "classifying",
+      };
+      let analysis: Analysis;
+      try {
+        analysis = await analyzeCapture(
+          subject,
+          AbortSignal.timeout(30000),
+          (progress) => progressListeners.get(id)?.({ analysis: progress }),
+        );
+      } catch (error) {
+        analysis = {
+          ...localAnalysis(text),
+          warning:
+            error instanceof Error
+              ? error.message
+              : "Image classification failed. Showing local fallback.",
+        };
+      }
+      const entry = {
+        fingerprint: analysis.source === "jev" ? fp : "",
+        analysis,
+        text,
+      };
+      remember(id, entry);
+      return entry;
+    } finally {
+      inflight.delete(key);
+      await rm(imagePath, { force: true }).catch(() => {});
+    }
+  })();
+  inflight.set(key, work);
+  return work;
+}
+/** Capture now, analyse right away in the background so the paste menu opens ready. */
+function analyzeInBackground(item: HistoryItem, png: Buffer) {
+  backgroundChain = backgroundChain
+    .then(() => analyzeItem(item.id, png, item))
+    .catch(() => {});
 }
 async function storeImage(
   image: Electron.NativeImage,
@@ -129,6 +273,7 @@ async function storeImage(
     .toPNG();
   const item = await history.add(png, thumbnail, { name, width, height });
   historyChanged();
+  analyzeInBackground(item, png);
   return item;
 }
 async function clipboardImage(): Promise<Electron.NativeImage | null> {
@@ -152,11 +297,9 @@ async function clipboardImage(): Promise<Electron.NativeImage | null> {
 async function selectHistory(id: string) {
   const job = startJob();
   capture = null;
-  window.webContents.send("capture", null);
+  broadcast("capture", null);
   const { item, image } = await history.get(id);
   if (job.signal.aborted) return;
-  const settings = getSettings();
-  const fingerprint = `hierarchy-v2:${settings.jevModel}:${settings.cloudEnabled}:${settings.hasJevKey}`;
   const cached = analysisCache.get(id);
   const next: Capture = {
     id,
@@ -171,42 +314,23 @@ async function selectHistory(id: string) {
       actions: [ACTIONS.text],
       stage: "category",
     },
-    phase: "reading",
+    phase: cached ? "classifying" : "reading",
   };
   capture = next;
   emit();
-  if (cached && cached.fingerprint === fingerprint) {
-    next.analysis = cached.analysis;
-    next.phase = "ready";
-    emit();
-    return;
-  }
-  const imagePath = path.join(tempDirectory, `${id}-${randomUUID()}.png`);
-  try {
-    await writeFile(imagePath, image, { mode: 0o600 });
-    const ocr = cached ? { text: cached.text } : await native("ocr", imagePath);
+  const listener = (update: { text?: string; analysis?: Analysis }) => {
     if (job.signal.aborted || capture?.id !== id) return;
-    next.ocrText = ocr.text;
+    if (update.text !== undefined) next.ocrText = update.text;
+    if (update.analysis) next.analysis = update.analysis;
     next.phase = "classifying";
     emit();
-    next.analysis = await analyzeCapture(
-      next,
-      AbortSignal.any([job.signal, AbortSignal.timeout(30000)]),
-      (progress) => {
-        if (!job.signal.aborted && capture?.id === id) {
-          next.analysis = progress;
-          emit();
-        }
-      },
-    );
-    if (!job.signal.aborted && next.analysis.source === "jev")
-      analysisCache.set(id, {
-        fingerprint,
-        analysis: next.analysis,
-        text: next.ocrText,
-      });
-    while (analysisCache.size > 100)
-      analysisCache.delete(analysisCache.keys().next().value!);
+  };
+  progressListeners.set(id, listener);
+  try {
+    const entry = await analyzeItem(id, image, item);
+    if (job.signal.aborted || capture?.id !== id) return;
+    next.ocrText = entry.text;
+    next.analysis = entry.analysis ?? localAnalysis(entry.text);
   } catch (error) {
     if (job.signal.aborted) return;
     next.analysis = {
@@ -217,7 +341,7 @@ async function selectHistory(id: string) {
           : "Image classification failed. Showing local fallback.",
     };
   } finally {
-    await rm(imagePath, { force: true }).catch(() => {});
+    if (progressListeners.get(id) === listener) progressListeners.delete(id);
   }
   if (!job.signal.aborted && capture?.id === id) {
     next.phase = "ready";
@@ -227,14 +351,14 @@ async function selectHistory(id: string) {
 async function smartPaste(): Promise<Capture> {
   controller?.abort();
   capture = null;
-  window.webContents.send("capture", null);
+  broadcast("capture", null);
   const image = await clipboardImage();
   const item = image
     ? await storeImage(image, "Clipboard screenshot")
     : (await history.list()).items[0];
   if (!item) {
     capture = null;
-    window.webContents.send("capture", null);
+    broadcast("capture", null);
     throw new Error(
       "No screenshots yet. Capture with your screenshot shortcut, copy an image, or add an image to history.",
     );
@@ -314,7 +438,7 @@ function registerShortcut(
     return globalShortcut.register(shortcut, () => {
       if (kind === "capture")
         void captureRegion().catch((error) => notice(error.message));
-      else void showPanel(true);
+      else void openPalette().catch((error) => notify(error.message));
     });
   } catch {
     return false;
@@ -335,13 +459,194 @@ async function copyResult(input: PasteResult) {
     }),
   ]);
 }
+async function generateFor(
+  id: string,
+  action: ActionId,
+  instruction = "",
+): Promise<PasteResult> {
+  if (!capture || capture.id !== id)
+    throw new Error("The screenshot changed. Select the action again.");
+  if (!Object.hasOwn(ACTIONS, action) || typeof instruction !== "string")
+    throw new Error("Invalid paste action.");
+  if (
+    action !== "text" &&
+    action !== "custom" &&
+    !capture.analysis.actions.some((a) => a.id === action)
+  )
+    throw new Error("Choose one of the actions selected for this screenshot.");
+  if (action === "text")
+    return generateOutput(
+      capture,
+      action,
+      instruction,
+      new AbortController().signal,
+    );
+  const job = startJob();
+  try {
+    return await generateOutput(
+      capture,
+      action,
+      instruction,
+      AbortSignal.any([job.signal, AbortSignal.timeout(60000)]),
+    );
+  } catch (error) {
+    if (job.signal.aborted) throw new Error("Cancelled.");
+    throw error;
+  }
+}
+// MARK: Inline paste menu
+function cursorAnchor(): Rect {
+  const { x, y } = screen.getCursorScreenPoint();
+  return { x, y, width: 1, height: 1 };
+}
+function placePalette(keepEdge = false) {
+  const display = screen.getDisplayMatching({
+    ...paletteAnchor,
+    width: Math.max(1, paletteAnchor.width),
+    height: Math.max(1, paletteAnchor.height),
+  });
+  let placed = placeMenu(paletteAnchor, paletteSize, display.workArea);
+  // When the menu resizes in place, keep the edge next to the caret fixed.
+  if (keepEdge && palettePlacement?.side === "above") {
+    const bounds = palette.getBounds();
+    placed = {
+      ...palettePlacement,
+      y: Math.max(display.workArea.y, bounds.y + bounds.height - paletteSize.height),
+    };
+  } else if (keepEdge && palettePlacement) placed = palettePlacement;
+  palettePlacement = placed;
+  palette.setBounds({ x: placed.x, y: placed.y, ...paletteSize });
+}
+function closePalette() {
+  if (paletteBusy) controller?.abort();
+  paletteBusy = false;
+  if (palette?.isVisible()) palette.hide();
+}
+async function openPalette() {
+  if (palette.isVisible()) return closePalette();
+  let context: Record<string, any> = {};
+  try {
+    context = await native("context");
+  } catch {
+    /* Fall back to the mouse position and the last known destination. */
+  }
+  if (context.pid && context.pid !== process.pid) destinationPid = context.pid;
+  // A newly copied screenshot (e.g. Ctrl+Cmd+Shift+4) becomes the latest item.
+  if (
+    context.clipboardImage &&
+    context.clipboardChange !== lastClipboardChange
+  ) {
+    lastClipboardChange = context.clipboardChange;
+    try {
+      const image = await clipboardImage();
+      if (image) await storeImage(image, "Clipboard screenshot");
+    } catch {
+      /* Fall through to existing history. */
+    }
+  }
+  const page = await history.list();
+  paletteAnchor = context.anchor ?? cursorAnchor();
+  paletteSize.height = 304;
+  palettePlacement = null;
+  placePalette();
+  palette.webContents.send("palette:open", {
+    items: page.items.slice(0, 30).map((item) => ({
+      id: item.id,
+      name: item.name,
+      createdAt: item.createdAt,
+      thumbnail: item.thumbnail,
+    })),
+    app: typeof context.app === "string" ? context.app : "",
+    trusted: context.trusted !== false,
+  });
+  palette.showInactive();
+  palette.focus();
+  if (page.items[0]) void selectHistory(page.items[0].id);
+}
+async function pasteInto(payload: { text: string; html: string }) {
+  const file = path.join(tempDirectory, `paste-${randomUUID()}.json`);
+  await writeFile(file, JSON.stringify(payload), { mode: 0o600 });
+  try {
+    if (!destinationPid) throw new Error("No destination.");
+    const outcome = await native(
+      "paste-restore",
+      String(destinationPid),
+      file,
+      String(process.pid),
+    );
+    if (outcome.ok) return "pasted";
+    notify(
+      outcome.reason === "untrusted"
+        ? "Result copied. Turn on Accessibility for SnapPaste to paste automatically. Press ⌘V for now."
+        : "You switched apps, so the result was copied instead. Press ⌘V to paste it.",
+    );
+    return "copied";
+  } catch {
+    await clipboard.write([
+      new ClipboardItem({
+        "text/plain": new Blob([payload.text], { type: "text/plain" }),
+        "text/html": new Blob([payload.html], { type: "text/html" }),
+      }),
+    ]);
+    notify("Couldn't paste automatically. The result is on your clipboard; press ⌘V.");
+    return "copied";
+  } finally {
+    await rm(file, { force: true }).catch(() => {});
+  }
+}
+function createPalette() {
+  palette = new BrowserWindow({
+    type: "panel",
+    width: paletteSize.width,
+    height: paletteSize.height,
+    show: false,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    hasShadow: true,
+    alwaysOnTop: true,
+    vibrancy: "popover",
+    visualEffectState: "active",
+    roundedCorners: true,
+    backgroundColor: "#00000000",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.cjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  palette.setAlwaysOnTop(true, "pop-up-menu");
+  palette.setVisibleOnAllWorkspaces(true, {
+    visibleOnFullScreen: true,
+    skipTransformProcessType: true,
+  });
+  palette.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  palette.webContents.on("will-navigate", (event) => event.preventDefault());
+  palette.on("blur", () => {
+    if (!paletteBusy) closePalette();
+  });
+  return MAIN_WINDOW_VITE_DEV_SERVER_URL
+    ? palette.loadURL(`${MAIN_WINDOW_VITE_DEV_SERVER_URL}#palette`)
+    : palette.loadFile(
+        path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
+        { hash: "palette" },
+      );
+}
 function handle(channel: string, fn: (...args: any[]) => any) {
   ipcMain.handle(channel, (event, ...args) => {
-    if (
-      event.sender !== window.webContents ||
-      event.senderFrame !== window.webContents.mainFrame
-    )
-      throw new Error("Untrusted request.");
+    const trusted = [window, palette].some(
+      (w) =>
+        w &&
+        event.sender === w.webContents &&
+        event.senderFrame === w.webContents.mainFrame,
+    );
+    if (!trusted) throw new Error("Untrusted request.");
     return fn(...args);
   });
 }
@@ -428,42 +733,34 @@ function setupIPC() {
     await selectHistory(capture.id);
     return capture;
   });
-  handle(
-    "result:generate",
-    async (id: string, action: ActionId, instruction = "") => {
-      if (!capture || capture.id !== id)
-        throw new Error("The screenshot changed. Select the action again.");
-      if (!Object.hasOwn(ACTIONS, action) || typeof instruction !== "string")
-        throw new Error("Invalid paste action.");
-      if (
-        action !== "text" &&
-        action !== "custom" &&
-        !capture.analysis.actions.some((a) => a.id === action)
-      )
-        throw new Error(
-          "Choose one of the actions selected for this screenshot.",
-        );
-      if (action === "text")
-        return generateOutput(
-          capture,
-          action,
-          instruction,
-          new AbortController().signal,
-        );
-      const job = startJob();
-      try {
-        return await generateOutput(
-          capture,
-          action,
-          instruction,
-          AbortSignal.any([job.signal, AbortSignal.timeout(60000)]),
-        );
-      } catch (error) {
-        if (job.signal.aborted) throw new Error("Cancelled.");
-        throw error;
-      }
-    },
-  );
+  handle("result:generate", generateFor);
+  handle("palette:select", (id: string) => {
+    if (typeof id !== "string") throw new Error("Invalid screenshot.");
+    return selectHistory(id);
+  });
+  handle("palette:run", async (id: string, action: ActionId) => {
+    paletteBusy = true;
+    try {
+      const result = await generateFor(id, action);
+      if (!palette.isVisible()) return "cancelled";
+      const payload = clipboardPayload(validatePasteResult(result));
+      paletteBusy = false;
+      palette.hide();
+      return await pasteInto(payload);
+    } finally {
+      paletteBusy = false;
+    }
+  });
+  handle("palette:close", closePalette);
+  handle("palette:resize", (height: number) => {
+    if (!Number.isFinite(height)) return;
+    paletteSize.height = Math.round(Math.min(Math.max(height, 56), 520));
+    placePalette(true);
+  });
+  handle("palette:library", () => {
+    closePalette();
+    positionPanel(false);
+  });
   handle("result:copy", copyResult);
   handle("result:paste", async (result: PasteResult) => {
     if (!destinationPid)
@@ -533,7 +830,7 @@ function updateTray() {
         label: "Smart paste",
         accelerator: settings.shortcut,
         click: () => {
-          void showPanel(true);
+          void openPalette().catch((error) => notify(error.message));
         },
       },
       {
@@ -584,6 +881,13 @@ else {
     );
     await history.open();
     tempDirectory = await mkdtemp(path.join(tmpdir(), "snappaste-"));
+    cacheFile = path.join(app.getPath("userData"), "analysis-cache.json");
+    await loadAnalysisCache();
+    // Menu-bar utility: no Dock icon, so the paste menu never pulls SnapPaste forward.
+    app.dock?.hide();
+    void native("context")
+      .then((c) => (lastClipboardChange = c.clipboardChange))
+      .catch(() => {});
     window = new BrowserWindow({
       width: 1040,
       height: 760,
@@ -609,6 +913,7 @@ else {
       }
     });
     setupIPC();
+    void createPalette();
     const settings = getSettings();
     const shortcutOk =
       registerShortcut(settings.shortcut) &&
@@ -627,7 +932,7 @@ else {
             {
               label: "Smart paste",
               click: () => {
-                void showPanel(true);
+                void openPalette().catch((error) => notify(error.message));
               },
             },
             {
@@ -673,7 +978,7 @@ else {
       await window.loadFile(
         path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
       );
-    window.show();
+    showMain();
     if (!shortcutOk)
       notice(
         "The smart-paste shortcut is already in use. Choose another in Settings.",

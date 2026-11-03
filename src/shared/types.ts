@@ -159,6 +159,17 @@ export interface SnapPasteAPI {
   onNotice(callback: (notice: string) => void): () => void;
   onSettings(callback: () => void): () => void;
   onMode(callback: (compact: boolean) => void): () => void;
+  paletteSelect(id: string): Promise<void>;
+  paletteRun(id: string, action: ActionId): Promise<"pasted" | "copied" | "cancelled">;
+  paletteClose(): Promise<void>;
+  paletteResize(height: number): Promise<void>;
+  paletteLibrary(): Promise<void>;
+  onPaletteOpen(callback: (state: PaletteOpen) => void): () => void;
+}
+export interface PaletteOpen {
+  items: Pick<HistoryItem, "id" | "name" | "createdAt" | "thumbnail">[];
+  app: string;
+  trusted: boolean;
 }
 declare global {
   interface Window {

@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { Capture, SnapPasteAPI } from "./shared/types";
+import type { Capture, PaletteOpen, SnapPasteAPI } from "./shared/types";
 const api: SnapPasteAPI = {
   getSettings: () => ipcRenderer.invoke("settings:get"),
   saveSettings: (value) => ipcRenderer.invoke("settings:save", value),
@@ -56,6 +56,19 @@ const api: SnapPasteAPI = {
     ipcRenderer.on("window:mode", listener);
     return () => {
       ipcRenderer.removeListener("window:mode", listener);
+    };
+  },
+  paletteSelect: (id) => ipcRenderer.invoke("palette:select", id),
+  paletteRun: (id, action) => ipcRenderer.invoke("palette:run", id, action),
+  paletteClose: () => ipcRenderer.invoke("palette:close"),
+  paletteResize: (height) => ipcRenderer.invoke("palette:resize", height),
+  paletteLibrary: () => ipcRenderer.invoke("palette:library"),
+  onPaletteOpen: (callback) => {
+    const listener = (_: Electron.IpcRendererEvent, value: PaletteOpen) =>
+      callback(value);
+    ipcRenderer.on("palette:open", listener);
+    return () => {
+      ipcRenderer.removeListener("palette:open", listener);
     };
   },
 };

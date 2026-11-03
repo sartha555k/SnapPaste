@@ -10,6 +10,110 @@ func emit(_ value: Any) throws {
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write(Data(message.utf8)); exit(1)
 }
+// MARK: - Insertion point
+// Screen rectangles use the global top-left origin shared by Accessibility and Electron.
+func primaryHeight() -> CGFloat { NSScreen.screens.first?.frame.height ?? 0 }
+func onScreen(_ rect: CGRect) -> Bool {
+    let height = primaryHeight()
+    return NSScreen.screens.contains { screen in
+        let f = screen.frame
+        return CGRect(x: f.minX, y: height - f.maxY, width: f.width, height: f.height).intersects(rect.insetBy(dx: -1, dy: -1))
+    }
+}
+func axElement(_ value: CFTypeRef?) -> AXUIElement? {
+    guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+    return (value as! AXUIElement)
+}
+func axCopy(_ element: AXUIElement, _ attribute: String) -> CFTypeRef? {
+    var value: CFTypeRef?
+    return AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success ? value : nil
+}
+func axGet<T: BitwiseCopyable>(_ value: CFTypeRef?, _ type: AXValueType, _ empty: T) -> T? {
+    guard let value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+    var result = empty
+    return AXValueGetValue(value as! AXValue, type, &result) ? result : nil
+}
+func boundsFor(_ element: AXUIElement, _ range: CFRange) -> CGRect? {
+    var r = range
+    guard let axRange = AXValueCreate(.cfRange, &r) else { return nil }
+    var value: CFTypeRef?
+    guard AXUIElementCopyParameterizedAttributeValue(element, kAXBoundsForRangeParameterizedAttribute as CFString, axRange, &value) == .success,
+          let rect = axGet(value, .cgRect, CGRect.zero),
+          rect.height > 2, rect.height < 400, rect.origin != .zero, onScreen(rect) else { return nil }
+    return rect
+}
+/// Where the user is typing: the caret when the app reports it, else the focused field.
+/// Many apps report no or bogus caret bounds, so every step validates and falls through.
+func insertionAnchor(pid: pid_t) -> [String: Any]? {
+    let app = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(app, 0.3)
+    // Chromium/Electron apps (Slack, Discord, VS Code) build their tree only when asked.
+    AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    guard let focused = axElement(axCopy(app, kAXFocusedUIElementAttribute)) else { return nil }
+    func anchor(_ rect: CGRect, _ source: String) -> [String: Any] {
+        ["x": rect.minX, "y": rect.minY, "width": rect.width, "height": rect.height, "source": source]
+    }
+    if let range = axGet(axCopy(focused, kAXSelectedTextRangeAttribute), .cfRange, CFRange()) {
+        if range.length > 0, let rect = boundsFor(focused, range) {
+            // A multi-line selection is tall; anchor at its last line.
+            return anchor(CGRect(x: rect.minX, y: rect.maxY - min(rect.height, 22), width: 1, height: min(rect.height, 22)), "caret")
+        }
+        if range.location > 0, let rect = boundsFor(focused, CFRange(location: range.location - 1, length: 1)) {
+            return anchor(CGRect(x: rect.maxX, y: rect.minY, width: 1, height: rect.height), "caret")
+        }
+        if let rect = boundsFor(focused, CFRange(location: range.location, length: 1)) {
+            return anchor(CGRect(x: rect.minX, y: rect.minY, width: 1, height: rect.height), "caret")
+        }
+    }
+    if let origin = axGet(axCopy(focused, kAXPositionAttribute), .cgPoint, CGPoint.zero),
+       let size = axGet(axCopy(focused, kAXSizeAttribute), .cgSize, CGSize.zero),
+       size.width > 8, size.height > 8, size.height < primaryHeight() * 0.8 {
+        let rect = CGRect(origin: origin, size: size)
+        if onScreen(rect) { return anchor(rect, "field") }
+    }
+    return nil
+}
+
+// MARK: - Clipboard-preserving paste
+typealias Snapshot = [[NSPasteboard.PasteboardType: Data]]
+func snapshot(_ pasteboard: NSPasteboard) -> Snapshot {
+    (pasteboard.pasteboardItems ?? []).map { item in
+        var data: [NSPasteboard.PasteboardType: Data] = [:]
+        for type in item.types { if let value = item.data(forType: type) { data[type] = value } }
+        return data
+    }
+}
+func restore(_ saved: Snapshot, _ pasteboard: NSPasteboard) {
+    pasteboard.clearContents()
+    let items = saved.map { values -> NSPasteboardItem in
+        let item = NSPasteboardItem()
+        for (type, data) in values { item.setData(data, forType: type) }
+        return item
+    }
+    if !items.isEmpty { pasteboard.writeObjects(items) }
+}
+func write(text: String, html: String, transient: Bool, _ pasteboard: NSPasteboard) -> Int {
+    pasteboard.clearContents()
+    let item = NSPasteboardItem()
+    item.setString(text, forType: .string)
+    if !html.isEmpty { item.setString(html, forType: .html) }
+    if transient {
+        // nspasteboard.org markers: clipboard managers skip this short-lived entry.
+        item.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.TransientType"))
+        item.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.AutoGeneratedType"))
+    }
+    pasteboard.writeObjects([item])
+    return pasteboard.changeCount
+}
+func sendCommandV() -> Bool {
+    guard let source = CGEventSource(stateID: .combinedSessionState),
+          let down = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true),
+          let up = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false) else { return false }
+    down.flags = .maskCommand; up.flags = .maskCommand
+    down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap)
+    return true
+}
+
 let args = CommandLine.arguments
 do {
     guard args.count > 1 else { fail("Missing helper command.") }
@@ -32,6 +136,52 @@ do {
         }
     case "frontmost":
         try emit(["pid": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0])
+    case "context":
+        // Everything the inline menu needs at shortcut time, in one fast call.
+        let front = NSWorkspace.shared.frontmostApplication
+        let pasteboard = NSPasteboard.general
+        var result: [String: Any] = [
+            "pid": front?.processIdentifier ?? 0,
+            "app": front?.localizedName ?? "",
+            "trusted": AXIsProcessTrusted(),
+            "clipboardChange": pasteboard.changeCount,
+            "clipboardImage": pasteboard.availableType(from: [.png, .tiff]) != nil,
+        ]
+        if AXIsProcessTrusted(), let pid = front?.processIdentifier, let anchor = insertionAnchor(pid: pid) {
+            result["anchor"] = anchor
+        }
+        try emit(result)
+    case "paste-restore":
+        // paste-restore <destination pid> <payload.json> <own pid>
+        // Writes the result, pastes into the destination, then restores the previous clipboard.
+        guard args.count == 5, let pid = Int32(args[2]), let own = Int32(args[4]) else { fail("Invalid paste request.") }
+        let payload = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: args[3]))) as? [String: Any] ?? [:]
+        let text = payload["text"] as? String ?? "", html = payload["html"] as? String ?? ""
+        let pasteboard = NSPasteboard.general
+        let front = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+        // Never yank the user back: if they moved to another app meanwhile, leave the result on the clipboard.
+        guard AXIsProcessTrusted(), front == pid || front == own, let target = NSRunningApplication(processIdentifier: pid) else {
+            _ = write(text: text, html: html, transient: false, pasteboard)
+            try emit(["ok": false, "reason": AXIsProcessTrusted() ? "focus-changed" : "untrusted"])
+            break
+        }
+        let saved = snapshot(pasteboard)
+        let written = write(text: text, html: html, transient: true, pasteboard)
+        if front != pid {
+            target.activate(options: [])
+            for _ in 0..<40 where NSWorkspace.shared.frontmostApplication?.processIdentifier != pid { Thread.sleep(forTimeInterval: 0.025) }
+        }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
+            pasteboard.clearContents(); _ = write(text: text, html: html, transient: false, pasteboard)
+            try emit(["ok": false, "reason": "focus-changed"]); break
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+        guard sendCommandV() else { fail("Could not create the paste event.") }
+        // Apps read the pasteboard asynchronously after Cmd+V; wait before restoring.
+        Thread.sleep(forTimeInterval: 0.6)
+        var restored = false
+        if pasteboard.changeCount == written { restore(saved, pasteboard); restored = true }
+        try emit(["ok": true, "restored": restored])
     case "ocr":
         guard args.count == 3 else { fail("An image path is required.") }
         let url = URL(fileURLWithPath: args[2])
