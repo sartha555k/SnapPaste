@@ -10,7 +10,7 @@ interface Stored {
   historyLimitMB: number;
   openaiModel: string;
   jevModel: string;
-  cloudEnabled: boolean;
+  cloudEnabled?: boolean;
   prompts: Settings["prompts"];
   openaiSecret?: string;
   jevSecret?: string;
@@ -22,7 +22,6 @@ const defaults: Stored = {
   historyLimitMB: 200,
   openaiModel: "gpt-4.1-mini",
   jevModel: "jev-1.14.0",
-  cloudEnabled: false,
   prompts: [],
 };
 let stored: Stored | undefined;
@@ -41,14 +40,23 @@ function read(): Stored {
   }
   return stored!;
 }
+// Development convenience: keys from the environment (loaded from the project's
+// git-ignored env file in main.ts). Never read in packaged builds; a key saved in
+// Settings always wins.
+function environmentKey(provider: "openai" | "jev"): string {
+  if (app.isPackaged) return "";
+  const value =
+    process.env[provider === "openai" ? "OPENAI_API_KEY" : "JEV_API_KEY"];
+  return value?.trim() ?? "";
+}
 export function secret(provider: "openai" | "jev"): string {
   const encrypted =
     read()[provider === "openai" ? "openaiSecret" : "jevSecret"];
-  if (!encrypted) return "";
+  if (!encrypted) return environmentKey(provider);
   try {
     return safeStorage.decryptString(Buffer.from(encrypted, "base64"));
   } catch {
-    return "";
+    return environmentKey(provider);
   }
 }
 export function getSettings(): Settings {
@@ -60,7 +68,9 @@ export function getSettings(): Settings {
     historyLimitMB: s.historyLimitMB,
     openaiModel: s.openaiModel,
     jevModel: s.jevModel,
-    cloudEnabled: s.cloudEnabled,
+    // Until the user explicitly toggles it, cloud is on when environment keys exist.
+    cloudEnabled:
+      s.cloudEnabled ?? !!(environmentKey("openai") || environmentKey("jev")),
     prompts: s.prompts,
     hasOpenAIKey: !!secret("openai"),
     hasJevKey: !!secret("jev"),
