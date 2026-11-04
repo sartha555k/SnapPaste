@@ -114,6 +114,129 @@ func sendCommandV() -> Bool {
     return true
 }
 
+// One process retains the actual focused AX element and insertion range.
+// A process ID or screen coordinate alone cannot identify the original field.
+final class PasteTarget {
+    let pid: pid_t
+    let token: Int
+    let field: AXUIElement?
+    let window: AXUIElement?
+    let selection: CFRange?
+    init(pid: pid_t, token: Int) {
+        self.pid = pid; self.token = token
+        let application = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(application, 0.4)
+        AXUIElementSetAttributeValue(application, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        field = axElement(axCopy(application, kAXFocusedUIElementAttribute))
+        window = field.flatMap { axElement(axCopy($0, kAXWindowAttribute)) }
+        selection = field.flatMap { axGet(axCopy($0, kAXSelectedTextRangeAttribute), .cfRange, CFRange()) }
+    }
+    func paste(text: String, html: String, own: pid_t) -> [String: Any] {
+        let pasteboard = NSPasteboard.general
+        func copied(_ reason: String) -> [String: Any] {
+            _ = write(text: text, html: html, transient: false, pasteboard)
+            return ["ok": false, "reason": reason]
+        }
+        guard AXIsProcessTrusted() else { return copied("untrusted") }
+        let front = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+        guard front == pid || front == own else { return copied("focus-changed") }
+        guard let target = NSRunningApplication(processIdentifier: pid), !target.isTerminated else { return copied("destination-closed") }
+        target.activate(options: [])
+        for _ in 0..<60 where NSWorkspace.shared.frontmostApplication?.processIdentifier != pid { RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.025)) }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return copied("focus-changed") }
+        if let window { _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString) }
+        if let field {
+            let application = AXUIElementCreateApplication(pid)
+            _ = AXUIElementSetAttributeValue(field, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.06))
+            guard let focused = axElement(axCopy(application, kAXFocusedUIElementAttribute)), CFEqual(focused, field) else { return copied("field-unavailable") }
+            if var range = selection {
+                var settable: DarwinBoolean = false
+                if AXUIElementIsAttributeSettable(field, kAXSelectedTextRangeAttribute as CFString, &settable) == .success, settable.boolValue {
+                    guard let value = AXValueCreate(.cfRange, &range), AXUIElementSetAttributeValue(field, kAXSelectedTextRangeAttribute as CFString, value) == .success else { return copied("selection-unavailable") }
+                }
+            }
+        }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return copied("focus-changed") }
+        let saved = snapshot(pasteboard)
+        let written = write(text: text, html: html, transient: true, pasteboard)
+        guard sendCommandV() else { return copied("paste-event-failed") }
+        Thread.sleep(forTimeInterval: 0.7)
+        if pasteboard.changeCount == written { restore(saved, pasteboard) }
+        return ["ok": true]
+    }
+}
+
+private var retainedPasteTarget: PasteTarget?
+private var retainedPasteToken = 0
+
+func pasteRequest(_ request: [String: Any]) -> [String: Any] {
+    let command = request["command"] as? String ?? ""
+    let own = pid_t(request["ownPid"] as? Int ?? 0)
+    var result: [String: Any] = [:]
+    if command == "capture" {
+        let front = NSWorkspace.shared.frontmostApplication
+        let pid = front?.processIdentifier ?? 0
+        let pasteboard = NSPasteboard.general
+        result = ["pid": pid, "app": front?.localizedName ?? "", "trusted": AXIsProcessTrusted(), "clipboardChange": pasteboard.changeCount, "clipboardImage": pasteboard.availableType(from: [.png, .tiff]) != nil]
+        if pid > 0, pid != own {
+            retainedPasteToken += 1
+            retainedPasteTarget = PasteTarget(pid: pid, token: retainedPasteToken)
+            result["token"] = retainedPasteToken
+            if AXIsProcessTrusted(), let anchor = insertionAnchor(pid: pid) { result["anchor"] = anchor }
+        }
+    } else if command == "status" {
+        result = ["trusted": AXIsProcessTrusted()]
+    } else if command == "paste", let expected = request["token"] as? Int, let target = retainedPasteTarget, expected == target.token {
+        result = target.paste(text: request["text"] as? String ?? "", html: request["html"] as? String ?? "", own: own)
+    } else { result = ["ok": false, "reason": "stale-target"] }
+    result["requestId"] = request["requestId"] as? Int ?? 0
+    return result
+}
+
+// Loaded into Electron's main process: Accessibility belongs to SnapPaste itself.
+@_cdecl("snappaste_request")
+public func snappasteRequest(_ raw: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>? {
+    do {
+        let data = Data(String(cString: raw).utf8)
+        guard let request = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return strdup("{}") }
+        let output = try JSONSerialization.data(withJSONObject: pasteRequest(request))
+        return strdup(String(data: output, encoding: .utf8) ?? "{}")
+    } catch { return strdup("{\"error\":true}") }
+}
+
+// Document structure is optional: basic OCR still works on older macOS versions.
+@available(macOS 26.0, *)
+func documentTables(_ url: URL) async throws -> [[String: Any]] {
+    let request = RecognizeDocumentsRequest()
+    let observations = try await request.perform(on: url)
+    return observations.flatMap { observation in
+        observation.document.tables.map { table in
+            let rows = table.rows.map { row in row.map { $0.content.text.transcript } }
+            let simple = table.rows.flatMap { $0 }.allSatisfy { $0.rowRange.count == 1 && $0.columnRange.count == 1 }
+            return ["rows": rows, "simple": simple] as [String: Any]
+        }
+    }
+}
+func detectedValues(_ text: String) -> [[String: String]] {
+    let types: NSTextCheckingResult.CheckingType = [.link, .phoneNumber, .date, .address]
+    guard let detector = try? NSDataDetector(types: types.rawValue) else { return [] }
+    let ns = text as NSString
+    var values = detector.matches(in: text, range: NSRange(location: 0, length: ns.length)).map { match -> [String: String] in
+        let label = match.resultType == .link ? (match.url?.scheme == "mailto" ? "Email" : "Link") : match.resultType == .phoneNumber ? "Phone" : match.resultType == .date ? "Date" : "Address"
+        return ["label": label, "value": ns.substring(with: match.range)]
+    }
+    if let regex = try? NSRegularExpression(pattern: "(?<![\\w@])#[\\p{L}\\p{N}_]+") {
+        values += regex.matches(in: text, range: NSRange(location: 0, length: ns.length)).map { ["label": "Hashtag", "value": ns.substring(with: $0.range)] }
+    }
+    var seen = Set<String>()
+    return values.filter { seen.insert($0["label"]! + ":" + $0["value"]!).inserted }
+}
+
+#if !SNAPPASTE_LIBRARY
+@main
+struct SnapPasteCLI {
+static func main() {
 let args = CommandLine.arguments
 do {
     guard args.count > 1 else { fail("Missing helper command.") }
@@ -188,6 +311,19 @@ do {
         var restored = false
         if pasteboard.changeCount == written { restore(saved, pasteboard); restored = true }
         try emit(["ok": true, "restored": restored])
+    case "structure":
+        guard args.count == 3 else { fail("An image path is required.") }
+        if #available(macOS 26.0, *) {
+            let semaphore = DispatchSemaphore(value: 0)
+            let url = URL(fileURLWithPath: args[2])
+            Task.detached {
+                do { try emit(["tables": try await documentTables(url)]) }
+                catch { try? emit(["tables": []]) }
+                fflush(stdout)
+                semaphore.signal()
+            }
+            semaphore.wait()
+        } else { try emit(["tables": []]) }
     case "ocr":
         guard args.count == 3 else { fail("An image path is required.") }
         let url = URL(fileURLWithPath: args[2])
@@ -201,7 +337,16 @@ do {
             let delta = $0.boundingBox.midY - $1.boundingBox.midY
             return abs(delta) > 0.012 ? delta > 0 : $0.boundingBox.minX < $1.boundingBox.minX
         }
-        try emit(["text": sorted.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n"), "lines": sorted.count])
+        let text = sorted.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+        var values = detectedValues(text)
+        let barcodeRequest = VNDetectBarcodesRequest()
+        if (try? handler.perform([barcodeRequest])) != nil {
+            values += (barcodeRequest.results ?? []).compactMap { code in
+                guard let value = code.payloadStringValue else { return nil }
+                return ["label": "Barcode", "value": value]
+            }
+        }
+        try emit(["text": text, "lines": sorted.count, "values": values])
     case "paste":
         guard AXIsProcessTrusted() else { fail("Enable Accessibility for SnapPaste in System Settings, then try Paste again. Copy is available without this permission.") }
         guard args.count == 3, let pid = Int32(args[2]), let target = NSRunningApplication(processIdentifier: pid) else { fail("The destination app is no longer running. Copy the result and paste it manually.") }
@@ -256,3 +401,7 @@ do {
     default: fail("Unknown helper command.")
     }
 } catch { fail(error.localizedDescription) }
+
+}
+}
+#endif

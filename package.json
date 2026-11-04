@@ -31,6 +31,7 @@
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "latest",
     "electron": "45.2.1",
+    "node-api-headers": "^1.9.0",
     "prettier": "^3.9.10",
     "tsx": "^4.19.0",
     "typescript": "^5.9.0",

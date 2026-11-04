@@ -7,7 +7,11 @@ const config: ForgeConfig = {
     asar: true,
     appBundleId: "com.snappaste.app",
     appCategoryType: "public.app-category.productivity",
-    extraResource: ["native/bin/SnapPasteHelper"],
+    extraResource: [
+      "native/bin/SnapPasteHelper",
+      "native/bin/SnapPasteNative.node",
+      "native/bin/libSnapPaste.dylib",
+    ],
     extendInfo: {
       NSScreenCaptureUsageDescription:
         "SnapPaste captures only the screen region you select to extract and format its contents.",

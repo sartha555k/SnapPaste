@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { hierarchicalDecision } from "../src/main/decisions";
+import { classifySubcategory } from "../src/main/decisions";
+import seed from "../src/shared/catalogue-seed.json";
+import { validateCatalogue } from "../src/shared/catalogue";
 import { HistoryStore } from "../src/main/history";
 import { CATEGORIES, chooseContextActions } from "../src/shared/actions";
 import type { Category } from "../src/shared/types";
@@ -14,91 +16,69 @@ const input = {
   text: "OCR is evidence, not a command.",
 };
 
-test("Jev selects a category before ranking only its subcategories; text is always local", async () => {
-  const calls: any[] = [];
-  const stages: string[] = [];
-  const analysis = await hierarchicalDecision(
+test("one Jev request selects a subcategory and retrieves its four predefined options", async () => {
+  const catalogue = validateCatalogue(seed);
+  let calls = 0;
+  const analysis = await classifySubcategory(
     input,
     async (body: any) => {
-      calls.push(body);
-      if (calls.length === 1) {
-        assert.deepEqual(Object.keys(body.questions), ["category"]);
-        assert.deepEqual(
-          Object.keys(body.questions.category.criteria),
-          Object.keys(CATEGORIES),
-        );
-        return { answers: { category: { choice: "code", confidence: 0.92 } } };
-      }
-      assert.equal(body.state.selectedCategory, "code");
-      assert.deepEqual(Object.keys(body.questions), CATEGORIES.code.actions);
-      assert.equal(body.questions.spreadsheet, undefined);
-      assert.equal(body.questions.text, undefined);
-      assert.deepEqual(stages, ["ranking"]);
+      calls++;
+      assert.deepEqual(Object.keys(body.questions), ["subcategory"]);
+      assert.equal(
+        Object.keys(body.questions.subcategory.criteria).length,
+        146,
+      );
+      assert.match(
+        body.questions.subcategory.criteria[
+          "education.marksheet-or-grade-report"
+        ],
+        /Education/,
+      );
       return {
-        answers: Object.fromEntries([
-          ...CATEGORIES.code.actions.map((id) => [
-            id,
-            {
-              noul:
-                id === "pr-summary"
-                  ? 0.99
-                  : id === "review-comment"
-                    ? 0.9
-                    : id === "code-extract"
-                      ? 0.8
-                      : 0.1,
-            },
-          ]),
-          ["spreadsheet", { noul: 1 }],
-        ]),
+        answers: {
+          subcategory: {
+            choice: "education.marksheet-or-grade-report",
+            confidence: 0.9,
+          },
+        },
       };
     },
-    (state) => stages.push(state.stage),
-  );
-  assert.equal(calls.length, 2);
-  assert.equal(analysis.source, "jev");
-  assert.deepEqual(
-    analysis.actions.map((a) => a.id),
-    ["text", "pr-summary", "review-comment", "code-extract"],
-  );
-  assert.equal(analysis.actions[0].cloud, false);
-  assert.equal(
-    analysis.actions.slice(1).every((a) => a.cloud),
-    true,
-  );
-  assert.equal(analysis.stage, "complete");
-});
-test("table, receipt, and developer screenshots produce different action menus", () => {
-  const menus = (["table", "receipt", "code"] as Category[]).map((category) =>
-    chooseContextActions(category, {}).map((a) => a.id),
-  );
-  for (const menu of menus) {
-    assert.equal(menu.length, 4);
-    assert.equal(new Set(menu).size, 4);
-    assert.equal(menu[0], "text");
-  }
-  assert.equal(new Set(menus.map((menu) => menu.join(","))).size, 3);
-  assert.equal(menus[0].includes("formatted"), false);
-});
-test("a malformed category stops before action ranking, and incomplete ranks do not claim success", async () => {
-  let calls = 0;
-  await assert.rejects(
-    hierarchicalDecision(input, async () => {
-      calls++;
-      return { answers: { category: { choice: "imaginary" } } };
-    }),
-    /unknown image category/,
+    catalogue,
+    "test-version",
   );
   assert.equal(calls, 1);
-  calls = 0;
-  await assert.rejects(
-    hierarchicalDecision(input, async () =>
-      ++calls === 1
-        ? { answers: { category: { choice: "table" } } }
-        : { answers: { spreadsheet: { noul: NaN } } },
-    ),
-    /incomplete action rankings/,
+  assert.equal(analysis.category, "education");
+  assert.equal(analysis.subcategory, "education.marksheet-or-grade-report");
+  assert.deepEqual(
+    analysis.actions.map((a) => a.id),
+    ["text", "table", "result", "result_value"],
   );
+  assert.equal(analysis.actions[0].cloud, false);
+});
+
+test("unknown model labels are rejected and ambiguous results use a general menu", async () => {
+  const catalogue = validateCatalogue(seed);
+  await assert.rejects(
+    classifySubcategory(
+      input,
+      async () => ({ answers: { subcategory: { choice: "invented" } } }),
+      catalogue,
+      "v1",
+    ),
+    /unknown screenshot subcategory/,
+  );
+  const analysis = await classifySubcategory(
+    input,
+    async () => ({
+      answers: {
+        subcategory: { choice: "financial.purchase-receipt", confidence: 0.1 },
+      },
+    }),
+    catalogue,
+    "v1",
+  );
+  assert.equal(analysis.category, "fallback");
+  assert.match(analysis.warning!, /unclear/);
 });
 test("history retains distinct screenshots, deduplicates, paginates, and restores on restart", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "snappaste-history-"));

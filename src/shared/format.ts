@@ -69,7 +69,8 @@ export function clipboardPayload(result: PasteResult): {
     return {
       text: result.text,
       html:
-        result.actionId === "text"
+        result.actionId === "text" ||
+        ["text", "json", "csv"].includes(result.outputFormat ?? "")
           ? `<div style="white-space:pre-wrap">${escapeHtml(result.text)}</div>`
           : markdownHtml(result.text),
     };

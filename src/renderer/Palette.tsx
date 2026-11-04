@@ -1,78 +1,84 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
-  Calendar,
-  ChartNoAxesCombined,
+  ArrowLeft,
+  Check,
   ChevronLeft,
   ChevronRight,
-  Clipboard,
+  ClipboardPaste,
   Code2,
+  Crop,
   FileText,
-  LayoutGrid,
+  Image,
   LoaderCircle,
-  MessageSquare,
-  PanelsTopLeft,
   Sparkles,
   Table2,
+  X,
+  Zap,
 } from "lucide-react";
-import { ACTIONS, CATEGORIES } from "../shared/actions";
-import type { Capture, PaletteOpen, PasteAction } from "../shared/types";
+import { ACTIONS } from "../shared/actions";
+import type {
+  Capture,
+  PaletteOpen,
+  PasteAction,
+  PasteResult,
+} from "../shared/types";
 import "./palette.css";
-
 const api = window.snapPaste;
-const icons: Record<PasteAction["icon"], typeof FileText> = {
-  text: FileText,
-  table: Table2,
-  code: Code2,
-  message: MessageSquare,
-  receipt: Clipboard,
-  calendar: Calendar,
-  chart: ChartNoAxesCombined,
-  design: PanelsTopLeft,
-  summary: LayoutGrid,
-  sparkles: Sparkles,
-};
-const errorText = (error: unknown) =>
-  (error instanceof Error ? error.message : String(error)).replace(
+const errorText = (e: unknown) =>
+  (e instanceof Error ? e.message : String(e)).replace(
     /^Error invoking remote method '[^']+': Error: /,
     "",
   );
-function ago(iso: string) {
-  const seconds = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
-  if (seconds < 60) return "just now";
-  if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)} h ago`;
-  return new Date(iso).toLocaleDateString();
-}
-
-/** The inline menu that opens next to the caret on the paste shortcut. */
+const ago = (iso: string) => {
+  const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+  return s < 60
+    ? "Just captured"
+    : s < 3600
+      ? `${Math.floor(s / 60)} min ago`
+      : new Date(iso).toLocaleDateString();
+};
+type Region = { x: number; y: number; width: number; height: number };
 export default function Palette() {
   const [open, setOpen] = useState<PaletteOpen | null>(null);
   const [index, setIndex] = useState(0);
   const [capture, setCapture] = useState<Capture | null>(null);
   const [selected, setSelected] = useState(0);
-  const [working, setWorking] = useState<string | null>(null);
+  const [working, setWorking] = useState("");
   const [error, setError] = useState("");
+  const [result, setResult] = useState<PasteResult | null>(null);
+  const [cropping, setCropping] = useState(false);
+  const [region, setRegion] = useState<Region | null>(null);
+  const origin = useRef<{ x: number; y: number } | null>(null);
   const root = useRef<HTMLDivElement>(null);
+  const session = useRef(0);
   const item = open?.items[index];
-
+  const current = capture && item?.id === capture.id ? capture : null;
+  const ready = current?.phase === "ready";
+  const rows: (PasteAction | null)[] = [
+    current?.analysis.actions[0] ?? ACTIONS.text,
+    ...(ready ? current.analysis.actions.slice(1, 4) : [null, null, null]),
+  ];
   useLayoutEffect(() => {
     document.documentElement.classList.add("palette");
   }, []);
   useEffect(() => {
     const off = [
       api.onPaletteOpen((state) => {
+        session.current++;
         setOpen(state);
         setIndex(0);
         setSelected(0);
-        setWorking(null);
+        setWorking("");
         setError("");
         setCapture(null);
+        setResult(null);
+        setCropping(false);
+        setRegion(null);
       }),
       api.onCapture(setCapture),
     ];
-    return () => off.forEach((unsubscribe) => unsubscribe());
+    return () => off.forEach((f) => f());
   }, []);
-  // Size the native panel to the content.
   useEffect(() => {
     if (!root.current) return;
     const observer = new ResizeObserver(() => {
@@ -82,165 +88,408 @@ export default function Palette() {
     observer.observe(root.current);
     return () => observer.disconnect();
   }, []);
-
-  const current = capture && item && capture.id === item.id ? capture : null;
-  const ready = current?.phase === "ready";
-  const ai = (current?.analysis.actions ?? []).filter((a) => a.id !== "text");
-  const rows: (PasteAction | null)[] = [
-    ACTIONS.text,
-    ...(ready ? ai.slice(0, 3) : [null, null, null]),
-  ];
-  const category = current && ready ? CATEGORIES[current.analysis.category] : null;
-
   async function run(row: number) {
     const action = rows[row];
-    if (!action || !item || working) return;
-    if (action.id === "text" && !current?.ocrText && current?.phase === "reading")
-      return; // OCR still running; the row shows a spinner.
+    if (!action || !current || working || current.phase === "reading") return;
+    if (action.id === "select_region") {
+      setCropping(true);
+      setRegion(null);
+      setError("");
+      return;
+    }
+    const token = session.current;
     setSelected(row);
     setError("");
     setWorking(action.title);
     try {
-      await api.paletteRun(item.id, action.id);
-      setWorking(null);
+      const outcome = await api.paletteRun(current.id, action.id);
+      if (token === session.current && typeof outcome === "object")
+        setResult(outcome.result);
     } catch (e) {
-      setWorking(null);
+      if (token === session.current) setError(errorText(e));
+    } finally {
+      if (token === session.current) setWorking("");
+    }
+  }
+  async function transfer(value?: string) {
+    if (!result || working) return;
+    setWorking("Pasting");
+    setError("");
+    try {
+      await api.palettePaste({
+        ...result,
+        text: value ?? result.text,
+        values: [],
+      });
+    } catch (e) {
       setError(errorText(e));
+    } finally {
+      setWorking("");
     }
   }
   function show(next: number) {
     if (!open || working || next < 0 || next >= open.items.length) return;
+    session.current++;
     setIndex(next);
     setSelected(0);
     setError("");
-    void api.paletteSelect(open.items[next].id);
+    setResult(null);
+    setCropping(false);
+    void api
+      .paletteSelect(open.items[next].id)
+      .catch((e) => setError(errorText(e)));
   }
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
-        setWorking(null);
-        void api.paletteClose();
-      } else if (working) return;
-      else if (e.key === "ArrowDown" || (e.key === "Tab" && !e.shiftKey)) {
+        session.current++;
+        if (result) {
+          setResult(null);
+          setWorking("");
+        } else if (cropping) setCropping(false);
+        else void api.paletteClose();
+        return;
+      }
+      if (
+        working ||
+        result ||
+        cropping ||
+        e.metaKey ||
+        e.ctrlKey ||
+        e.altKey ||
+        e.isComposing
+      )
+        return;
+      if (["ArrowDown", "ArrowUp", "Tab"].includes(e.key)) {
         e.preventDefault();
-        setSelected((s) => (s + 1) % rows.length);
-      } else if (e.key === "ArrowUp" || (e.key === "Tab" && e.shiftKey)) {
-        e.preventDefault();
-        setSelected((s) => (s + rows.length - 1) % rows.length);
+        const d =
+          e.key === "ArrowUp" || (e.key === "Tab" && e.shiftKey) ? -1 : 1;
+        setSelected((s) => (s + d + 4) % 4);
       } else if (e.key === "ArrowRight") show(index + 1);
       else if (e.key === "ArrowLeft") show(index - 1);
-      else if (e.key === "Enter") void run(selected);
-      else if (/^[1-4]$/.test(e.key)) void run(Number(e.key) - 1);
+      else if (e.key === "Enter") {
+        e.preventDefault();
+        void run(selected);
+      } else if (/^[1-4]$/.test(e.key)) void run(Number(e.key) - 1);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });
-
-  if (working)
-    return (
-      <div className="sp-palette sp-working" ref={root}>
-        <LoaderCircle size={16} className="sp-spin" />
-        <span className="sp-working-title">{working}…</span>
-        <kbd>esc</kbd>
-      </div>
-    );
+  function point(e: React.PointerEvent<HTMLImageElement>) {
+    const r = e.currentTarget.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)),
+      y: Math.max(0, Math.min(1, (e.clientY - r.top) / r.height)),
+    };
+  }
+  async function crop() {
+    if (!current || !region || working) return;
+    setWorking("Reading selected region");
+    setError("");
+    try {
+      await api.cropCapture(current.id, region);
+      const next = await api.getCapture();
+      if (next) {
+        setOpen((o) =>
+          o
+            ? {
+                ...o,
+                items: [
+                  {
+                    id: next.id,
+                    name: next.name,
+                    thumbnail: next.dataUrl,
+                    createdAt: new Date().toISOString(),
+                  },
+                  ...o.items,
+                ],
+              }
+            : o,
+        );
+        setIndex(0);
+        setCapture(next);
+      }
+      setCropping(false);
+      setRegion(null);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setWorking("");
+    }
+  }
   return (
     <div className="sp-palette" ref={root}>
-      {!open || !item ? (
+      <div className="sp-brand">
+        <span>
+          <ClipboardPaste size={13} /> SnapPaste
+        </span>
+        <button
+          aria-label="Close paste menu"
+          onClick={() => void api.paletteClose()}
+        >
+          <X size={13} />
+        </button>
+      </div>
+      {!item ? (
         <div className="sp-empty">
-          <strong>No screenshots yet</strong>
-          <span>Capture one with ⌘⌥S, or copy an image, then paste again.</span>
+          <Image size={25} />
+          <strong>Your next paste starts here</strong>
+          <span>Take a screenshot, then press your smart-paste shortcut.</span>
+          <button onClick={() => void api.paletteLibrary()}>
+            Open library
+          </button>
         </div>
       ) : (
         <>
           <header className="sp-head">
-            <img src={item.thumbnail} alt="" />
+            <img src={item.thumbnail} alt="Recent screenshot" />
             <div className="sp-meta">
-              <strong>{item.name}</strong>
+              <strong>
+                {ready
+                  ? (current.analysis.subcategoryTitle ?? "Screenshot")
+                  : "Getting your screenshot ready"}
+              </strong>
               <span>
-                {ago(item.createdAt)}
-                {category ? ` · ${category.title}` : " · Reading…"}
-                {ready && current?.analysis.source === "local" ? (
-                  <em title={current.analysis.warning}> · local</em>
-                ) : null}
+                {ago(item.createdAt)} · {item.name}
               </span>
             </div>
-            {open.items.length > 1 && (
-              <div className="sp-nav">
+            <div className="sp-nav">
+              <button
+                disabled={index === 0 || !!working}
+                onClick={() => show(index - 1)}
+                aria-label="Newer screenshot"
+              >
+                <ChevronLeft size={14} />
+              </button>
+              <span>
+                {index + 1}/{open!.items.length}
+              </span>
+              <button
+                disabled={index === open!.items.length - 1 || !!working}
+                onClick={() => show(index + 1)}
+                aria-label="Older screenshot"
+              >
+                <ChevronRight size={14} />
+              </button>
+            </div>
+          </header>
+          {cropping ? (
+            <div className="sp-crop">
+              <p>Drag over the part you want to reuse.</p>
+              <div className="sp-crop-frame">
+                <div className="sp-crop-image">
+                  <img
+                    src={current?.dataUrl ?? item.thumbnail}
+                    alt="Select screenshot region"
+                    draggable={false}
+                    onPointerDown={(e) => {
+                      origin.current = point(e);
+                      setRegion(null);
+                      e.currentTarget.setPointerCapture(e.pointerId);
+                    }}
+                    onPointerMove={(e) => {
+                      if (!origin.current) return;
+                      const p = point(e),
+                        o = origin.current;
+                      setRegion({
+                        x: Math.min(p.x, o.x),
+                        y: Math.min(p.y, o.y),
+                        width: Math.abs(p.x - o.x),
+                        height: Math.abs(p.y - o.y),
+                      });
+                    }}
+                    onPointerUp={() => {
+                      origin.current = null;
+                    }}
+                  />
+                  {region && (
+                    <div
+                      className="sp-selection"
+                      style={{
+                        left: `${region.x * 100}%`,
+                        top: `${region.y * 100}%`,
+                        width: `${region.width * 100}%`,
+                        height: `${region.height * 100}%`,
+                      }}
+                    />
+                  )}
+                </div>
+              </div>
+              <div className="sp-controls">
+                <button onClick={() => setCropping(false)}>Back</button>
                 <button
-                  disabled={index === 0}
-                  onClick={() => show(index - 1)}
-                  aria-label="Newer screenshot"
+                  disabled={
+                    !region ||
+                    region.width < 0.01 ||
+                    region.height < 0.01 ||
+                    !!working
+                  }
+                  onClick={() => void crop()}
                 >
-                  <ChevronLeft size={14} />
-                </button>
-                <span>
-                  {index + 1}/{open.items.length}
-                </span>
-                <button
-                  disabled={index === open.items.length - 1}
-                  onClick={() => show(index + 1)}
-                  aria-label="Older screenshot"
-                >
-                  <ChevronRight size={14} />
+                  Use selected region
                 </button>
               </div>
-            )}
-          </header>
-          <ul className="sp-rows" role="listbox">
-            {rows.map((action, row) =>
-              action ? (
-                <li
-                  key={action.id}
-                  role="option"
-                  aria-selected={row === selected}
-                  className={row === selected ? "sp-row sp-on" : "sp-row"}
-                  onMouseEnter={() => setSelected(row)}
-                  onClick={() => void run(row)}
-                >
-                  <span className="sp-icon">
-                    {React.createElement(icons[action.icon], { size: 15 })}
-                  </span>
-                  <span className="sp-text">
-                    <strong>{action.title}</strong>
-                    <small>{action.description}</small>
-                  </span>
-                  <kbd>{row + 1}</kbd>
-                </li>
-              ) : (
-                <li key={`loading-${row}`} className="sp-row sp-loading">
-                  <span className="sp-icon">
-                    <Sparkles size={15} />
-                  </span>
-                  <span className="sp-text">
-                    <span className="sp-bar" />
-                    <span className="sp-bar sp-short" />
-                  </span>
-                </li>
-              ),
-            )}
-          </ul>
-          {error && <p className="sp-error">{error}</p>}
-          <footer className="sp-foot">
-            {open.trusted ? (
-              <span>
-                <kbd>↵</kbd> paste <kbd>↑↓</kbd> choose
-                {open.items.length > 1 && (
-                  <>
-                    {" "}
-                    <kbd>←→</kbd> screenshot
-                  </>
-                )}
-              </span>
-            ) : (
-              <button onClick={() => void api.openPermission("accessibility")}>
-                Allow Accessibility to paste automatically
+            </div>
+          ) : result ? (
+            <div className="sp-preview">
+              <button className="sp-back" onClick={() => setResult(null)}>
+                <ArrowLeft size={13} /> Options
               </button>
-            )}
-            <button className="sp-link" onClick={() => void api.paletteLibrary()}>
-              Library
-            </button>
+              {result.values?.length ? (
+                <>
+                  <p>Choose the exact value to paste</p>
+                  <div className="sp-values">
+                    {result.values.map((v, i) => (
+                      <button
+                        key={i}
+                        disabled={!!working}
+                        onClick={() => void transfer(v.value)}
+                      >
+                        <small>{v.label}</small>
+                        <span>{v.value}</span>
+                        <kbd>↵</kbd>
+                      </button>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <textarea
+                    aria-label="Edit extracted text before pasting"
+                    value={result.text}
+                    onChange={(e) =>
+                      setResult({ ...result, text: e.target.value })
+                    }
+                  />
+                  <div className="sp-controls">
+                    <button
+                      disabled={!!working}
+                      onClick={() => void transfer()}
+                    >
+                      Paste edited text
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          ) : (
+            <>
+              <div className="sp-section-label">
+                PASTE AS{" "}
+                <span>
+                  {ready && current.analysis.source === "local"
+                    ? "General menu"
+                    : ready
+                      ? "Matched to this screenshot"
+                      : "Local text is available first"}
+                </span>
+              </div>
+              <ul
+                className="sp-rows"
+                role="listbox"
+                aria-label="Screenshot paste options"
+              >
+                {rows.map((action, row) => {
+                  if (!action)
+                    return (
+                      <li className="sp-row sp-loading" key={row}>
+                        <span className="sp-icon">
+                          <Sparkles size={15} />
+                        </span>
+                        <span className="sp-text">
+                          <span className="sp-bar" />
+                          <span className="sp-bar sp-short" />
+                        </span>
+                      </li>
+                    );
+                  const Icon =
+                    action.icon === "table"
+                      ? Table2
+                      : action.icon === "code"
+                        ? Code2
+                        : action.id === "select_region"
+                          ? Crop
+                          : action.id === "original"
+                            ? Image
+                            : action.id === "text"
+                              ? FileText
+                              : Sparkles;
+                  const cached = current?.preparedActions?.includes(action.id);
+                  return (
+                    <li
+                      key={action.id}
+                      role="option"
+                      aria-selected={row === selected}
+                      aria-disabled={
+                        !current || current.phase === "reading" || !!working
+                      }
+                      className={`sp-row ${row === selected ? "sp-on" : ""}`}
+                      onMouseEnter={() => setSelected(row)}
+                      onClick={() => void run(row)}
+                    >
+                      <span
+                        className={`sp-icon ${!action.cloud ? "sp-local" : ""}`}
+                      >
+                        <Icon size={16} />
+                      </span>
+                      <span className="sp-text">
+                        <strong>{action.title}</strong>
+                        <small>
+                          {cached
+                            ? "Prepared · ready to paste"
+                            : action.description}
+                        </small>
+                      </span>
+                      <span
+                        className={`sp-badge ${!action.cloud ? "sp-badge-local" : ""}`}
+                      >
+                        {cached ? (
+                          <Check size={10} />
+                        ) : !action.cloud ? (
+                          <Zap size={10} />
+                        ) : null}
+                        {cached
+                          ? "Ready"
+                          : action.cloud
+                            ? action.localFirst
+                              ? "Local / AI"
+                              : "AI"
+                            : "Local"}
+                      </span>
+                      <kbd>{row + 1}</kbd>
+                    </li>
+                  );
+                })}
+              </ul>
+            </>
+          )}
+          {working && (
+            <div className="sp-progress" role="status">
+              <LoaderCircle size={13} className="sp-spin" />
+              {working}…
+            </div>
+          )}
+          {error && (
+            <p className="sp-error" role="alert">
+              {error}
+            </p>
+          )}
+          <footer className="sp-foot">
+            <span>
+              {open!.trusted ? (
+                <>
+                  <kbd>↵</kbd> paste <kbd>↑↓</kbd> choose
+                </>
+              ) : (
+                <button
+                  onClick={() => void api.openPermission("accessibility")}
+                >
+                  Enable automatic paste
+                </button>
+              )}
+            </span>
+            <button onClick={() => void api.paletteLibrary()}>Library ↗</button>
           </footer>
         </>
       )}

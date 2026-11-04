@@ -70,6 +70,9 @@ function prettyShortcut(value: string) {
 const megabytes = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 
 export default function App() {
+  const [catalogueInfo, setCatalogueInfo] = useState<Awaited<
+    ReturnType<typeof api.catalogueStatus>
+  > | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [history, setHistory] = useState<HistoryPage | null>(null);
   const [capture, setCapture] = useState<Capture | null>(null);
@@ -106,6 +109,10 @@ export default function App() {
     setCapture(value);
   }, []);
   useEffect(() => {
+    void api.catalogueStatus().then(setCatalogueInfo);
+    const syncTimer = setInterval(() => {
+      void api.catalogueStatus().then(setCatalogueInfo);
+    }, 15000);
     void api
       .getSettings()
       .then(setSettings)
@@ -129,7 +136,10 @@ export default function App() {
         setCustom(false);
       }),
     ];
-    return () => off.forEach((unsubscribe) => unsubscribe());
+    return () => {
+      clearInterval(syncTimer);
+      off.forEach((unsubscribe) => unsubscribe());
+    };
   }, [receiveCapture, refreshHistory]);
   useEffect(() => {
     if (!toast) return;
@@ -166,7 +176,7 @@ export default function App() {
     setBusy(
       id === "text"
         ? "Reading local text"
-        : `Creating ${ACTIONS[id].title.toLowerCase()}`,
+        : `Creating ${(capture.analysis.actions.find((a) => a.id === id)?.title ?? ACTIONS[id]?.title ?? "output").toLowerCase()}`,
     );
     setError("");
     try {
@@ -245,7 +255,7 @@ export default function App() {
     capture?.phase === "reading"
       ? "Reading text locally…"
       : capture?.analysis.stage === "ranking"
-        ? "Jev is choosing the best three actions…"
+        ? "Loading your screenshot’s menu…"
         : "Jev is recognizing this screenshot…";
   const historyCards = history?.items.map((item) => (
     <button
@@ -362,7 +372,9 @@ export default function App() {
                     ? prettyShortcut(settings.shortcut)
                     : "your shortcut"}
                 </strong>
-                <small>Jev chooses relevant paste actions.</small>
+                <small>
+                  Your screenshot’s menu prepares in the background.
+                </small>
               </span>
             </div>
             <ArrowRight size={16} />
@@ -443,7 +455,11 @@ export default function App() {
                 : "Local screenshot storage"}{" "}
               · oldest captures expire when full
             </span>
-            <span>No AI call when you capture</span>
+            <span title={catalogueInfo?.error}>
+              {catalogueInfo
+                ? `${catalogueInfo.categories} categories · ${catalogueInfo.subcategories} screenshot types · ${catalogueInfo.source === "supabase" ? "Synced" : catalogueInfo.source === "cache" ? "Cached" : "Built-in menus"}`
+                : "Menus prepare in the background"}
+            </span>
           </div>
         </main>
       ) : (
@@ -510,7 +526,10 @@ export default function App() {
                   <small>
                     {classifying && capture.analysis.stage !== "ranking"
                       ? "Recognizing content"
-                      : CATEGORIES[capture.analysis.category].title}{" "}
+                      : (capture.analysis.subcategoryTitle ??
+                        capture.analysis.categoryTitle ??
+                        CATEGORIES[capture.analysis.category]?.title ??
+                        "Screenshot")}{" "}
                     · choose another
                   </small>
                 </span>
@@ -527,7 +546,13 @@ export default function App() {
                       >
                         <ArrowLeft size={16} />
                       </button>
-                      <h2>{ACTIONS[result.actionId].title}</h2>
+                      <h2>
+                        {capture.analysis.actions.find(
+                          (a) => a.id === result.actionId,
+                        )?.title ??
+                          ACTIONS[result.actionId]?.title ??
+                          "Ready to paste"}
+                      </h2>
                       {result.kind === "text" && (
                         <button
                           className="text-button"
@@ -657,15 +682,16 @@ export default function App() {
                           </>
                         ) : capture.analysis.source === "jev" ? (
                           <>
-                            <Sparkles size={11} /> JEV · CATEGORY → ACTION
-                            RANKING
+                            <Sparkles size={11} /> MATCHED TO YOUR SCREENSHOT
                           </>
                         ) : (
                           "LOCAL FALLBACK · JEV NOT USED"
                         )}
                       </div>
                       <h2>How would you like to paste?</h2>
-                      <p>One local option. Three matched to this screenshot.</p>
+                      <p>
+                        Four useful choices. Local processing where supported.
+                      </p>
                     </div>
                     <div className="action-list">
                       {Array.from({ length: 4 }, (_, index) => {
@@ -679,7 +705,7 @@ export default function App() {
                               <span className="skeleton-icon" />
                               <span>
                                 <strong>Finding a useful action…</strong>
-                                <small>After the category is selected</small>
+                                <small>Matching the screenshot type</small>
                               </span>
                               <span className="action-key">{index + 1}</span>
                             </div>
@@ -930,8 +956,8 @@ function SettingsDialog({
                   }
                 />
                 <small>
-                  Captures a region into history. No AI processing until paste
-                  time.
+                  Captures a region and prepares its paste options in the
+                  background.
                 </small>
               </label>
               <label className="setting-field">
@@ -958,8 +984,9 @@ function SettingsDialog({
                   <strong>Save copied screenshots automatically</strong>
                   <p>
                     While SnapPaste runs, save new clipboard images locally. Use
-                    ⇧ ⌃ ⌘ 4 for macOS screenshots copied to the clipboard.
-                    Screenshots saved only to Desktop are not monitored.
+                    ⇧ ⌃ ⌘ 4 for macOS screenshots copied to the clipboard. New
+                    standard macOS screenshot files are also detected in your
+                    screenshot folder.
                   </p>
                 </div>
                 <button
@@ -981,9 +1008,9 @@ function SettingsDialog({
                 <div>
                   <strong>Enable cloud processing</strong>
                   <p>
-                    Jev receives only the screenshot you choose at paste time,
-                    first to classify it, then to rank actions. OpenAI receives
-                    it when you select an AI action.
+                    After capture, Jev selects a screenshot type in one request.
+                    Option 2 prepares automatically when AI is needed; options 3
+                    and 4 run when selected. Supported extraction stays local.
                   </p>
                 </div>
                 <button
@@ -1081,8 +1108,8 @@ function SettingsDialog({
                   </button>
                 )}
                 <small>
-                  Without Jev, suggestions use simple local text rules, clearly
-                  labeled.
+                  Without Jev, a general fallback menu is shown. Local text and
+                  supported extraction remain available.
                 </small>
               </label>
               <label className="setting-field">

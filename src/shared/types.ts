@@ -1,52 +1,5 @@
-export type Category =
-  | "table"
-  | "code"
-  | "receipt"
-  | "event"
-  | "document"
-  | "chat"
-  | "chart"
-  | "design"
-  | "unknown";
-export type ActionId =
-  | "text"
-  | "formatted"
-  | "spreadsheet"
-  | "summary"
-  | "bug-report"
-  | "message"
-  | "receipt"
-  | "event"
-  | "custom"
-  | "table-markdown"
-  | "table-json"
-  | "table-compare"
-  | "table-email"
-  | "code-extract"
-  | "code-explain"
-  | "pr-summary"
-  | "review-comment"
-  | "receipt-items"
-  | "receipt-check"
-  | "invoice-email"
-  | "event-invite"
-  | "event-agenda"
-  | "event-checklist"
-  | "document-outline"
-  | "document-translate"
-  | "document-email"
-  | "chat-reply"
-  | "chat-decisions"
-  | "chat-tasks"
-  | "chat-handoff"
-  | "chart-data"
-  | "chart-insights"
-  | "chart-caption"
-  | "chart-report"
-  | "design-description"
-  | "design-feedback"
-  | "design-spec"
-  | "design-alttext";
+export type Category = string;
+export type ActionId = string;
 export interface PasteAction {
   id: ActionId;
   icon:
@@ -65,9 +18,18 @@ export interface PasteAction {
   description: string;
   badge: string;
   cloud: boolean;
+  processor?: "local_ocr" | "ai" | "app_control";
+  outputFormat?: string;
+  executionRules?: string;
+  contextInstruction?: string;
+  localFirst?: boolean;
 }
 export interface Analysis {
   category: Category;
+  categoryTitle?: string;
+  subcategory?: string;
+  subcategoryTitle?: string;
+  catalogueVersion?: string;
   source: "local" | "jev" | "gpt";
   actions: PasteAction[];
   warning?: string;
@@ -84,6 +46,8 @@ export interface Capture {
   bytes: number;
   ocrText: string;
   analysis: Analysis;
+  local?: LocalExtraction;
+  preparedActions?: string[];
   phase: "reading" | "classifying" | "ready";
 }
 export interface PasteResult {
@@ -95,6 +59,8 @@ export interface PasteResult {
   notes: string[];
   source: "Apple Vision" | "OpenAI";
   elapsedMs: number;
+  values?: { label: string; value: string }[];
+  outputFormat?: string;
 }
 export interface SavedPrompt {
   id: string;
@@ -160,7 +126,22 @@ export interface SnapPasteAPI {
   onSettings(callback: () => void): () => void;
   onMode(callback: (compact: boolean) => void): () => void;
   paletteSelect(id: string): Promise<void>;
-  paletteRun(id: string, action: ActionId): Promise<"pasted" | "copied" | "cancelled">;
+  paletteRun(
+    id: string,
+    action: ActionId,
+  ): Promise<"pasted" | "copied" | "cancelled" | { result: PasteResult }>;
+  palettePaste(result: PasteResult): Promise<string>;
+  cropCapture(
+    id: string,
+    region: { x: number; y: number; width: number; height: number },
+  ): Promise<void>;
+  catalogueStatus(): Promise<{
+    source: string;
+    categories: number;
+    subcategories: number;
+    fetchedAt: string | null;
+    error?: string;
+  }>;
   paletteClose(): Promise<void>;
   paletteResize(height: number): Promise<void>;
   paletteLibrary(): Promise<void>;
@@ -192,4 +173,10 @@ export interface HistoryPage {
   bytes: number;
   limitBytes: number;
   hasMore: boolean;
+}
+
+export interface LocalExtraction {
+  text: string;
+  tables: { rows: string[][]; simple: boolean }[];
+  values: { label: string; value: string }[];
 }

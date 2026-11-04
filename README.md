@@ -1,114 +1,74 @@
 # SnapPaste
 
-**Capture now. Decide at paste.**
+Capture what you see. Paste what you need.
 
-A macOS menu-bar app that keeps screenshot history and turns the selected screenshot into something useful when you paste. The menu has exactly four choices: local text first, then three actions chosen for the image by Jev. OpenAI generates only the transformation you select.
+A macOS menu-bar utility with a compact paste menu near the insertion point. It extracts and reformats visible screenshot content; it does not explain screenshots, diagnose errors or provide unsolicited advice.
 
-## Run locally
+## Run
 
-Requirements: macOS, Node.js 22.12+ (Node 24 recommended), npm, and Apple’s Command Line Tools (`xcode-select --install`). No Apple Developer membership is needed for development.
+Requires macOS, Node.js 22.12+ and Apple Command Line Tools. Full local document/table recognition requires macOS 26+. Earlier versions retain local OCR and can use AI for supported transformations.
 
 ```sh
 npm ci
 npm start
 ```
 
-Closing the window leaves SnapPaste running in the menu bar. Quit using its menu or Cmd+Q.
+Add Jev and OpenAI keys in Settings and enable cloud processing. Development can also use a git-ignored `.env` with `OPENAI_API_KEY` and `JEV_API_KEY` (or `TYPESAFE_API_KEY`). Never put provider secret keys in renderer code or committed files.
 
-## The workflow
+## Workflow
 
-1. **Capture several screenshots:** press **Command+Option+S** to capture a region directly into local history. Repeat as often as needed. You can also import several PNG/JPEG files at once.
-2. **Go to your destination app:** focus the message, document, or spreadsheet where you want the content.
-3. **Press Command+Option+V:** a compact paste menu opens. A clipboard image is saved and selected if one is present; otherwise the most recent saved screenshot is selected. Click the screenshot at the top to choose an older one.
-4. **Choose from four options:** the first is always **Just the text**, using Apple Vision on this Mac. The other three come from a category-specific action pool ranked by Jev.
-5. **Review and paste:** selecting an AI action sends that action’s prompt and the image to OpenAI. Edit the result, then copy or paste into the previous app.
+1. Capture with **Command+Option+S**, import images, or take a standard macOS screenshot saved to the configured screenshot folder. Optional clipboard monitoring also detects copied images.
+2. Local OCR begins in the background. Jev makes **one Choice request** over the predefined subcategories; the selected subcategory determines its four saved options. No action-ranking request is needed.
+3. Local table recognition runs alongside classification. Slot 2 prepares automatically if it has a local result or OpenAI is enabled. Slots 3 and 4 run only when selected. Concurrent prefetch/click requests share work.
+4. Focus your destination and press **Command+Option+V**. The small inline popup shows the recent screenshot and four options. Use **1–4**, **up/down + Enter**, or click. Left/right switches screenshots; Escape dismisses the popup.
+5. Output pastes into the destination. A value-extraction action opens an exact-value picker. Recovery actions allow region selection or editing local text. Original-image recovery copies the image for manual Cmd+V.
 
-Both global shortcuts are configurable in **Settings**. Normal Cmd+V continues working. The shortcut opens SnapPaste’s own floating menu; this is not an extension of another app’s native paste menu.
+Normal Cmd+V is unchanged. Shortcuts are configurable. The menu uses caret bounds when the destination exposes them, then focused-field or mouse-position fallback. Automatic paste requires Accessibility; otherwise the result is copied with a notification. A destination switch also uses copy fallback. The original text field and selected text range are retained while the popup is open, then restored before Paste. Cursor and paste operations run in-process under SnapPaste’s own Accessibility permission; OCR remains in the helper. The clipboard is restored after a successful paste.
 
-### Multiple screenshots and storage
+## Definitions and caching
 
-History persists across restarts. It has no screenshot-count limit; storage is bounded by a configurable **50–2,000 MB** budget (default **200 MB**). Identical images are deduplicated. The oldest app-owned history images expire when the budget fills. Original imported files are never deleted. A single image must be at most 20 MB and 40 megapixels.
+Supabase contains the public catalogue: `categories`, `subcategories`, `actions`, and `subcategory_actions`. Only the project URL and **publishable** key are used by `src/main/catalogue.ts`. No secret/service-role key is shipped.
 
-Optionally enable **Save copied screenshots automatically** in Settings. While SnapPaste runs, a native clipboard watcher saves new copied images locally. Use Control+Command+Shift+4 for screenshots copied by macOS. Images saved only to Desktop are not monitored; use SnapPaste’s capture shortcut or import them. Automatic clipboard collection is off by default.
+- Startup loads the last valid cache, then refreshes from Supabase in the background.
+- Definitions refresh every six hours without a database request during menu opening.
+- A bundled copy of the approved 20 categories, 146 subcategories, 72 actions and 584 slot mappings is available on first launch/offline.
+- Validation requires four distinct options per subcategory and local text in slot 1. Partial/invalid syncs preserve the last good catalogue.
+- The local definition cache is `cache/definitions.json` under Electron's `app.getPath('userData')`, normally `~/Library/Application Support/SnapPaste/`.
+- This definition cache contains menu definitions, not screenshot images. Screenshot history and OCR/classification caches are separate files under the same application-support directory.
 
-Saving an image triggers **no OCR or cloud request**. OCR and classification happen when an image is selected at paste time. Successful classifications are cached in memory for reuse during that session. The full history does not get uploaded.
+Catalogue edits are made through SQL/admin access; app clients have read-only access. Classification cache keys include the definition version and Jev settings. Output cache keys also include the screenshot, action and OpenAI model/settings.
 
-### Jev’s two-stage classification
+## Local-first output
 
-There are eight content categories plus a general-image fallback:
+Apple Vision extracts text on-device. On macOS 26+, its document API also recognises table rows and cells. Data detectors extract visible links, emails, phone numbers, dates and addresses; literal hashtags and barcode payloads are also collected.
 
-| Category             | Examples of eligible actions                                                      |
-| -------------------- | --------------------------------------------------------------------------------- |
-| Tables & data        | Spreadsheet cells, formatted table, JSON rows, comparison, sharing message        |
-| Code & development   | Copy code, explain code, bug report, PR summary, review comment, teammate message |
-| Receipts & invoices  | Expense fields, itemized rows, readable summary, invoice message                  |
-| Events & schedules   | Event details, invitation, agenda table, attendance checklist                     |
-| Documents & articles | Clean formatting, summary, outline, English translation, email                    |
-| Conversations        | Reply, decisions, action items, handoff, summary                                  |
-| Charts & analytics   | Visible values, chart summary, caption, report notes                              |
-| Interfaces & visuals | Screen description, design feedback, UI handoff, alt text                         |
+The app first attempts supported local processing regardless of the database action's initial `ai` assignment:
 
-**Request 1** asks Jev to choose the main category from the image and local OCR. **Request 2** contains only that category’s candidate actions and asks Jev to score their usefulness. The three highest-ranked actions join local text in the menu. A PR and a plain code error can therefore receive different actions within the same category.
+- Plain text and exact-value picking.
+- Visible links/addresses when detected.
+- One rectangular table without merged cells: rich table, spreadsheet cells or CSV.
+- Formatting an already valid JSON transcription.
 
-The second request depends on the first; they are not parallel independent classifications. There is no fixed “formatted” second slot. Jev makes decisions; OpenAI writes the chosen output. Unknown or mixed images have general candidate actions. Classification can be wrong—review the source and result.
+Semantic summaries, handoffs, and field-specific extraction use OpenAI initially. Complex/multiple/merged tables use AI fallback rather than guessing cell structure locally. Converting recognised cells to output formats is local. Recognition can still be wrong: outputs remain editable in the library result view.
 
-### API setup
+Jev image support is experimental. A failed or ambiguous classification gets a labelled general menu. AI output can report that the requested information is unavailable instead of inventing it. These paths do not claim verified model understanding or a guaranteed response time.
 
-Supply your own keys in Settings and enable cloud processing. Keys are encrypted with Electron `safeStorage` through macOS secure storage, stay out of the renderer after saving, and are never included in the repository or packaged app.
+## History and screenshots
 
-- **Jev / TypeSafe:** image classification and action rankings. Default `jev-1.14.0`, with experimental image support enabled in provider requests.
-- **OpenAI:** selected transformations via the Responses API and strict structured output. Default `gpt-4.1-mini`; configure a compatible image + Structured Outputs model available to your account.
-- **Local text:** Apple Vision OCR. No API key, network, or model-generation call needed. With cloud enabled, opening the menu can independently start Jev classification while local text is available.
+History deduplicates images and persists across restarts. Storage is bounded by a configurable 50–2,000 MB budget (default 200 MB); oldest app-owned captures expire when full. Original imported/source files are not removed. A single image must be at most 20 MB and 40 megapixels.
 
-If Jev is disabled, unavailable, or returns invalid decisions, the UI explicitly labels suggestions **LOCAL FALLBACK**. These are simple OCR rules, not claimed model understanding. Without OpenAI, local text still works; AI actions explain which configuration is missing. There are no fake AI responses.
+The folder watcher observes new filenames beginning `Screenshot` or `Screen Shot` in the configured screenshot location (Desktop by default). It does not scan old files. Localised/custom screenshot names may require import. Restart after changing macOS's screenshot save location. Clipboard monitoring is optional and initially off.
 
-Settings changes invalidate the classification cache. Only the next screenshot you choose is analyzed using the new configuration. Saved custom prompts are available in Settings and from the paste menu.
-
-### Try it without private data
-
-Click **Try a table** and **Try a pull request** in screenshot history. These create clearly labeled sample images locally and store both. Click either screenshot to open its paste menu. Without keys, local text is real Apple Vision OCR; with keys enabled, Jev and OpenAI calls are real provider requests and use your credits.
-
-### Results and permissions
-
-Text is editable. Tables have editable cells and copy as tab-separated text plus an HTML table. Basic Markdown formatting also supplies HTML for rich paste; support depends on the destination app. Source text is escaped and spreadsheet cells are protected against formula injection.
-
-**Capture region** needs Screen Recording permission for the app macOS identifies (Electron during development, SnapPaste when packaged). Automatic paste needs **Accessibility** permission. Import, local OCR, and copy do not need those permissions. A permission change may require restarting the app.
-
-Invoke the shortcut from your destination app so SnapPaste remembers it. Paste restores that application and sends Cmd+V. This confirms sending the event, not insertion into arbitrary third-party apps. Copy and manual paste are always available.
-
-## Stack and layout
-
-Electron + React + TypeScript, Vite/Forge, and a Swift helper using AppKit, CoreGraphics, and Apple Vision. Provider requests run in the main process. This bring-your-own-key prototype has no hosted backend.
-
-| Path                           | Purpose                                                                       |
-| ------------------------------ | ----------------------------------------------------------------------------- |
-| `src/main.ts`                  | Lifecycle, tray, shortcuts, history integration, capture, clipboard, IPC      |
-| `src/main/history.ts`          | Persistent local image history, deduplication, pagination, disk quota         |
-| `src/main/decisions.ts`        | Sequential category → category-scoped action ranking                          |
-| `src/main/providers.ts`        | Jev image transport and selected OpenAI transformation                        |
-| `src/main/settings.ts`         | Settings and encrypted keys                                                   |
-| `src/shared/actions.ts`        | Category taxonomy and action-specific prompts                                 |
-| `src/shared/format.ts`         | Result validation and safe clipboard representations                          |
-| `src/preload.ts`               | Isolated, limited renderer bridge                                             |
-| `src/renderer/`                | Screenshot library, compact paste menu, result editor, settings               |
-| `native/SnapPasteHelper.swift` | OCR, clipboard change watcher, focus restoration, paste, samples              |
-| `tests/`                       | Classification sequencing/scoping, history durability/quota, output integrity |
-
-## Validate and package
+## Validation and packaging
 
 ```sh
 npm run check
-npm run package  # unsigned local .app in out/
-npm run make     # unsigned ZIP for local testing
+npm run package
+npm run make
 ```
 
-The native helper builds for the current Mac’s architecture. Build separately for Intel and Apple Silicon; the helper is not universal. Signing/notarization and automatic updates remain release work.
+The unsigned app is under `out/SnapPaste-darwin-arm64/` on Apple Silicon. Native helper architecture follows the build machine. Signing, notarisation and auto-updates remain release work.
 
-Current limits: macOS only; a single selected screenshot per transformation; no multi-image merging or deep-research mode. Small or cropped text can be lost in OCR or Jev’s resized image. Models see visible content, not your repository, unseen thread history, or destination app context. Requests time out and can be canceled. Real AI features require provider access, credits, and connectivity. Automated tests verify workflow behavior rather than model accuracy.
+Tests cover catalogue integrity, offline/failed sync, one-request classification routing, ambiguity fallback, local output eligibility, shared prefetch/click work, history durability/quota, popup placement and clipboard formats. Live provider accuracy and third-party paste compatibility require real-device testing.
 
-## Provider references
-
-- [TypeSafe image input](https://docs.typesafe.ai/images)
-- [TypeSafe System One API](https://docs.typesafe.ai/api/system-one)
-- [OpenAI image inputs](https://developers.openai.com/api/docs/guides/images-vision)
-- [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
+Main modules: `src/main/catalogue.ts` (sync/cache), `src/shared/catalogue.ts` (validation/menus), `src/main/decisions.ts` (Jev classification), `src/main/local.ts` (local output), `src/main/providers.ts` (AI fallback), `src/main/result-cache.ts` (output deduplication), `src/renderer/Palette.tsx` (inline UI), and `native/SnapPasteHelper.swift` (Vision/focus/clipboard).

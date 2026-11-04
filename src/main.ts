@@ -18,7 +18,8 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
+import { watch, type FSWatcher } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { ACTIONS, localAnalysis } from "./shared/actions";
@@ -30,10 +31,16 @@ import type {
   SettingsUpdate,
   Analysis,
   HistoryItem,
+  LocalExtraction,
 } from "./shared/types";
 import { getSettings, saveSettings, validateSettings } from "./main/settings";
 import { analyzeCapture, generateOutput } from "./main/providers";
 import { HistoryStore } from "./main/history";
+import { CatalogueStore } from "./main/catalogue";
+import { catalogueAnalysis } from "./shared/catalogue";
+import { annotateLocalActions, localOutput } from "./main/local";
+import { ResultCache } from "./main/result-cache";
+import { NativePaste } from "./main/native-paste";
 import { placeMenu, type Placement, type Rect } from "./shared/placement";
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string;
@@ -51,18 +58,26 @@ let window: BrowserWindow;
 let tray: Tray;
 let capture: Capture | null = null;
 let destinationPid = 0;
+let pasteBridge: NativePaste;
+let destinationToken: number | undefined;
 let quitting = false;
 let controller: AbortController | null = null;
 let tempDirectory = "";
 let history: HistoryStore;
 let watcher: ChildProcess | null = null;
 let screenshotActive = false;
+let catalogue: CatalogueStore;
+let definitionTimer: NodeJS.Timeout;
+let fileWatcher: FSWatcher | undefined;
+const fileTimers = new Map<string, NodeJS.Timeout>();
+const results = new ResultCache();
 // Inline paste menu: a non-activating panel, so the destination app keeps focus.
 let palette: BrowserWindow;
 let paletteAnchor: Rect = { x: 0, y: 0, width: 1, height: 1 };
 let palettePlacement: Placement | null = null;
-const paletteSize = { width: 360, height: 304 };
+const paletteSize = { width: 390, height: 340 };
 let paletteBusy = false;
+let paletteSession = 0;
 let lastClipboardChange = -1;
 
 // OCR text and Jev analysis per screenshot, persisted so older screenshots open instantly.
@@ -71,6 +86,7 @@ interface CacheEntry {
   fingerprint: string;
   analysis: Analysis | null;
   text: string;
+  local?: LocalExtraction;
 }
 const analysisCache = new Map<string, CacheEntry>();
 const inflight = new Map<string, Promise<CacheEntry>>();
@@ -94,7 +110,8 @@ async function native(command: string, ...args: string[]): Promise<any> {
 }
 function broadcast(channel: string, ...args: unknown[]) {
   for (const target of [window, palette])
-    if (target && !target.isDestroyed()) target.webContents.send(channel, ...args);
+    if (target && !target.isDestroyed())
+      target.webContents.send(channel, ...args);
 }
 function notice(message: string) {
   window?.webContents.send("notice", message);
@@ -109,8 +126,15 @@ function emit() {
 }
 async function rememberDestination() {
   try {
-    const { pid } = await native("frontmost");
-    if (pid && pid !== process.pid) destinationPid = pid;
+    const context = await pasteBridge.capture();
+    if (
+      context.pid &&
+      context.pid !== process.pid &&
+      context.token !== undefined
+    ) {
+      destinationPid = context.pid;
+      destinationToken = context.token;
+    }
   } catch {
     /* Copy remains available even when native app focus cannot be read. */
   }
@@ -150,7 +174,15 @@ function historyChanged() {
 }
 function fingerprint() {
   const s = getSettings();
-  return `hierarchy-v2:${s.jevModel}:${s.cloudEnabled}:${s.hasJevKey}`;
+  return `catalogue-v1:${catalogue.version}:${s.jevModel}:${s.cloudEnabled}:${s.hasJevKey}`;
+}
+function fallbackAnalysis() {
+  return catalogueAnalysis(
+    catalogue.data,
+    "fallback.several-content-types-with-no-clear-primary-subject",
+    catalogue.version,
+    "local",
+  );
 }
 async function loadAnalysisCache() {
   try {
@@ -195,11 +227,30 @@ function analyzeItem(
     const imagePath = path.join(tempDirectory, `${id}-${randomUUID()}.png`);
     try {
       let text = cached?.text;
-      if (text === undefined) {
+      let local = cached?.local;
+      if (text === undefined || !local) {
         await writeFile(imagePath, png, { mode: 0o600 });
-        text = String((await native("ocr", imagePath)).text ?? "");
-        remember(id, { fingerprint: "", analysis: null, text });
+        const ocr = await native("ocr", imagePath);
+        text = String(ocr.text ?? "");
+        local = {
+          text,
+          values: Array.isArray(ocr.values) ? ocr.values : [],
+          tables: [],
+        };
+        remember(id, { fingerprint: "", analysis: null, text, local });
       }
+      text = text ?? "";
+      // Structure and classification run independently after the first OCR result.
+      const structure = (async () => {
+        if (local?.tables.length) return local.tables;
+        await writeFile(imagePath, png, { mode: 0o600 });
+        try {
+          return (await native("structure", imagePath)).tables ?? [];
+        } catch {
+          return [];
+        }
+      })();
+      const definitions = { data: catalogue.data, version: catalogue.version };
       progressListeners.get(id)?.({ text });
       const subject: Capture = {
         id,
@@ -209,7 +260,8 @@ function analyzeItem(
         height: meta.height,
         bytes: meta.bytes,
         ocrText: text,
-        analysis: localAnalysis(text),
+        local,
+        analysis: fallbackAnalysis(),
         phase: "classifying",
       };
       let analysis: Analysis;
@@ -218,23 +270,52 @@ function analyzeItem(
           subject,
           AbortSignal.timeout(30000),
           (progress) => progressListeners.get(id)?.({ analysis: progress }),
+          definitions,
         );
       } catch (error) {
         console.error("[snappaste] Jev classification failed:", error);
         analysis = {
-          ...localAnalysis(text),
+          ...fallbackAnalysis(),
           warning:
             error instanceof Error
               ? error.message
               : "Image classification failed. Showing local fallback.",
         };
       }
+      local = { text, values: local?.values ?? [], tables: await structure };
+      subject.local = local;
+      subject.analysis = analysis;
+      annotateLocalActions(subject);
+      analysis = subject.analysis;
       const entry = {
+        local,
         fingerprint: analysis.source === "jev" ? fp : "",
         analysis,
         text,
       };
       remember(id, entry);
+      // Only slot 2 is prefetched; slots 3/4 stay demand-driven.
+      const second = analysis.actions[1];
+      if (
+        second &&
+        second.processor !== "app_control" &&
+        (localOutputSafe(subject, second.id) ||
+          (getSettings().cloudEnabled && getSettings().hasOpenAIKey))
+      ) {
+        void preparedOutput(subject, second.id)
+          .then(() => {
+            if (
+              capture?.id === id &&
+              results.has(resultKey(subject, second.id))
+            ) {
+              capture.preparedActions = [second.id];
+              emit();
+            }
+          })
+          .catch(() => {
+            /* Selection can retry a failed prefetch. */
+          });
+      }
       return entry;
     } finally {
       inflight.delete(key);
@@ -310,8 +391,9 @@ async function selectHistory(id: string) {
     height: item.height,
     bytes: item.bytes,
     ocrText: cached?.text ?? "",
+    local: cached?.local,
     analysis: {
-      ...localAnalysis(""),
+      ...fallbackAnalysis(),
       actions: [ACTIONS.text],
       stage: "category",
     },
@@ -331,12 +413,16 @@ async function selectHistory(id: string) {
     const entry = await analyzeItem(id, image, item);
     if (job.signal.aborted || capture?.id !== id) return;
     next.ocrText = entry.text;
-    next.analysis = entry.analysis ?? localAnalysis(entry.text);
+    next.local = entry.local;
+    next.analysis = entry.analysis ?? fallbackAnalysis();
+    next.preparedActions = next.analysis.actions
+      .filter((a) => results.has(resultKey(next, a.id)))
+      .map((a) => a.id);
   } catch (error) {
     if (job.signal.aborted) return;
     console.error("[snappaste] screenshot analysis failed:", error);
     next.analysis = {
-      ...localAnalysis(next.ocrText),
+      ...fallbackAnalysis(),
       warning:
         error instanceof Error
           ? error.message
@@ -432,6 +518,57 @@ function configureWatcher() {
     ),
   );
 }
+async function configureScreenshotFiles() {
+  let folder = path.join(homedir(), "Desktop");
+  try {
+    const { stdout } = await exec("/usr/bin/defaults", [
+      "read",
+      "com.apple.screencapture",
+      "location",
+    ]);
+    const configured = stdout.trim();
+    if (configured)
+      folder = configured.startsWith("~/")
+        ? path.join(homedir(), configured.slice(2))
+        : configured;
+  } catch {
+    /* macOS defaults to Desktop. */
+  }
+  try {
+    fileWatcher = watch(folder, (_event, name) => {
+      if (
+        !name ||
+        !/^(screenshot|screen shot).*\.(png|jpe?g)$/i.test(String(name))
+      )
+        return;
+      const file = path.join(folder, String(name));
+      clearTimeout(fileTimers.get(file));
+      fileTimers.set(
+        file,
+        setTimeout(() => {
+          fileTimers.delete(file);
+          void (async () => {
+            const info = await stat(file);
+            if (info.size <= 0 || info.size > 20 * 1024 * 1024) return;
+            await storeImage(
+              nativeImage.createFromBuffer(await readFile(file)),
+              path.basename(file),
+            );
+          })().catch(() => {});
+        }, 700),
+      );
+    });
+    fileWatcher.on("error", () => {
+      notice(
+        "Screenshot folder unavailable. The capture shortcut and copied images still work.",
+      );
+    });
+  } catch {
+    notice(
+      "Screenshot folder unavailable. The capture shortcut and copied images still work.",
+    );
+  }
+}
 function registerShortcut(
   shortcut: string,
   kind: "paste" | "capture" = "paste",
@@ -461,6 +598,23 @@ async function copyResult(input: PasteResult) {
     }),
   ]);
 }
+function resultKey(subject: Capture, action: string) {
+  const settings = getSettings();
+  return `${subject.id}:${subject.analysis.catalogueVersion}:${action}:${settings.openaiModel}:${settings.cloudEnabled}:${settings.hasOpenAIKey}`;
+}
+function localOutputSafe(subject: Capture, action: string) {
+  try {
+    const option = subject.analysis.actions.find((a) => a.id === action);
+    return option ? localOutput(subject, option) : null;
+  } catch {
+    return null;
+  }
+}
+function preparedOutput(subject: Capture, action: string) {
+  return results.get(resultKey(subject, action), () =>
+    generateOutput(subject, action, "", AbortSignal.timeout(60000)),
+  );
+}
 async function generateFor(
   id: string,
   action: ActionId,
@@ -468,33 +622,19 @@ async function generateFor(
 ): Promise<PasteResult> {
   if (!capture || capture.id !== id)
     throw new Error("The screenshot changed. Select the action again.");
-  if (!Object.hasOwn(ACTIONS, action) || typeof instruction !== "string")
-    throw new Error("Invalid paste action.");
   if (
-    action !== "text" &&
-    action !== "custom" &&
+    typeof instruction !== "string" ||
     !capture.analysis.actions.some((a) => a.id === action)
   )
-    throw new Error("Choose one of the actions selected for this screenshot.");
-  if (action === "text")
-    return generateOutput(
-      capture,
-      action,
-      instruction,
-      new AbortController().signal,
-    );
-  const job = startJob();
-  try {
-    return await generateOutput(
-      capture,
-      action,
-      instruction,
-      AbortSignal.any([job.signal, AbortSignal.timeout(60000)]),
-    );
-  } catch (error) {
-    if (job.signal.aborted) throw new Error("Cancelled.");
-    throw error;
-  }
+    throw new Error("Choose one of the options for this screenshot.");
+  const subject = capture;
+  if (!instruction) return preparedOutput(subject, action);
+  return generateOutput(
+    subject,
+    action,
+    instruction,
+    AbortSignal.timeout(60000),
+  );
 }
 // MARK: Inline paste menu
 function cursorAnchor(): Rect {
@@ -513,26 +653,38 @@ function placePalette(keepEdge = false) {
     const bounds = palette.getBounds();
     placed = {
       ...palettePlacement,
-      y: Math.max(display.workArea.y, bounds.y + bounds.height - paletteSize.height),
+      y: Math.max(
+        display.workArea.y,
+        bounds.y + bounds.height - paletteSize.height,
+      ),
     };
   } else if (keepEdge && palettePlacement) placed = palettePlacement;
   palettePlacement = placed;
   palette.setBounds({ x: placed.x, y: placed.y, ...paletteSize });
 }
 function closePalette() {
+  paletteSession++;
   if (paletteBusy) controller?.abort();
   paletteBusy = false;
   if (palette?.isVisible()) palette.hide();
 }
 async function openPalette() {
   if (palette.isVisible()) return closePalette();
+  paletteSession++;
   let context: Record<string, any> = {};
   try {
-    context = await native("context");
+    context = await pasteBridge.capture();
   } catch {
     /* Fall back to the mouse position and the last known destination. */
   }
-  if (context.pid && context.pid !== process.pid) destinationPid = context.pid;
+  if (
+    context.pid &&
+    context.pid !== process.pid &&
+    context.token !== undefined
+  ) {
+    destinationPid = context.pid;
+    destinationToken = context.token;
+  }
   // A newly copied screenshot (e.g. Ctrl+Cmd+Shift+4) becomes the latest item.
   if (
     context.clipboardImage &&
@@ -551,7 +703,7 @@ async function openPalette() {
     await native("unhide", String(process.pid)).catch(() => {});
   const page = await history.list();
   paletteAnchor = context.anchor ?? cursorAnchor();
-  paletteSize.height = 304;
+  paletteSize.height = 340;
   palettePlacement = null;
   placePalette();
   palette.webContents.send("palette:open", {
@@ -587,37 +739,48 @@ async function returnFocus() {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 }
-async function pasteInto(payload: { text: string; html: string }) {
-  const file = path.join(tempDirectory, `paste-${randomUUID()}.json`);
-  await writeFile(file, JSON.stringify(payload), { mode: 0o600 });
-  try {
-    if (!destinationPid) throw new Error("No destination.");
-    const outcome = await native(
-      "paste-restore",
-      String(destinationPid),
-      file,
-      String(process.pid),
-    );
-    console.error("[snappaste] paste outcome:", JSON.stringify(outcome));
-    if (outcome.ok) return "pasted";
-    notify(
-      outcome.reason === "untrusted"
-        ? "Result copied. Turn on Accessibility for SnapPaste to paste automatically. Press ⌘V for now."
-        : "You switched apps, so the result was copied instead. Press ⌘V to paste it.",
-    );
-    return "copied";
-  } catch (error) {
-    console.error("[snappaste] paste failed:", error);
+async function pasteInto(
+  payload: { text: string; html: string },
+  token = destinationToken,
+) {
+  const copied = async () => {
     await clipboard.write([
       new ClipboardItem({
         "text/plain": new Blob([payload.text], { type: "text/plain" }),
         "text/html": new Blob([payload.html], { type: "text/html" }),
       }),
     ]);
-    notify("Couldn't paste automatically. The result is on your clipboard; press ⌘V.");
+  };
+  try {
+    if (token === undefined) {
+      await copied();
+      notify(
+        "Click inside the destination text field, then press your smart-paste shortcut. Result copied for now.",
+      );
+      return "copied";
+    }
+    const outcome = await pasteBridge.paste(token, payload);
+    if (outcome.ok) return "pasted";
+    // A stale target is never allowed to paste into a newly opened menu's field.
+    await copied();
+    notify(
+      outcome.reason === "untrusted"
+        ? "Automatic paste needs Accessibility for this SnapPaste build. Open SnapPaste Settings → macOS permissions. Result copied for now."
+        : [
+              "field-unavailable",
+              "selection-unavailable",
+              "destination-closed",
+            ].includes(outcome.reason)
+          ? "The original text field is no longer available. Result copied; click the field and press ⌘V."
+          : "The destination changed. Result copied; press ⌘V where you want it.",
+    );
     return "copied";
-  } finally {
-    await rm(file, { force: true }).catch(() => {});
+  } catch {
+    await copied();
+    notify(
+      "Could not restore the destination. Result copied; press ⌘V to paste.",
+    );
+    return "copied";
   }
 }
 function createPalette() {
@@ -678,6 +841,7 @@ function handle(channel: string, fn: (...args: any[]) => any) {
 }
 function setupIPC() {
   handle("settings:get", getSettings);
+  handle("catalogue:status", () => catalogue.status());
   handle("settings:save", async (update: SettingsUpdate) => {
     validateSettings(update);
     const previous = getSettings();
@@ -698,6 +862,7 @@ function setupIPC() {
     try {
       const result = saveSettings(update);
       analysisCache.clear();
+      results.clear();
       configureWatcher();
       await history.setLimit(result.historyLimitMB * 1024 * 1024);
       historyChanged();
@@ -762,22 +927,96 @@ function setupIPC() {
   handle("result:generate", generateFor);
   handle("palette:select", (id: string) => {
     if (typeof id !== "string") throw new Error("Invalid screenshot.");
+    paletteSession++;
     return selectHistory(id);
   });
   handle("palette:run", async (id: string, action: ActionId) => {
+    if (
+      !capture ||
+      capture.id !== id ||
+      !capture.analysis.actions.some((a) => a.id === action)
+    )
+      throw new Error("Choose an option for the current screenshot.");
+    const session = paletteSession;
+    const target = destinationToken;
     paletteBusy = true;
     try {
+      if (action === "original") {
+        await clipboard.write([
+          new ClipboardItem({
+            "image/png": new Blob(
+              [
+                new Uint8Array(
+                  Buffer.from(capture.dataUrl.split(",")[1], "base64"),
+                ),
+              ],
+              { type: "image/png" },
+            ),
+          }),
+        ]);
+        palette.hide();
+        notify("Original image copied. Press ⌘V to paste it.");
+        return "copied";
+      }
+      if (action === "select_region")
+        throw new Error("Select a region from the screenshot preview.");
       const result = await generateFor(id, action);
-      if (!palette.isVisible()) return "cancelled";
+      if (
+        !palette.isVisible() ||
+        session !== paletteSession ||
+        capture?.id !== id
+      )
+        return "cancelled";
+      if (result.values?.length || action === "review_text") return { result };
       const payload = clipboardPayload(validatePasteResult(result));
       paletteBusy = false;
       palette.hide();
       await returnFocus();
-      return await pasteInto(payload);
+      return await pasteInto(payload, target);
     } finally {
       paletteBusy = false;
     }
   });
+  handle("palette:paste", async (result: PasteResult) => {
+    const payload = clipboardPayload(validatePasteResult(result));
+    const target = destinationToken;
+    paletteBusy = false;
+    palette.hide();
+    await returnFocus();
+    return pasteInto(payload, target);
+  });
+  handle(
+    "capture:crop",
+    async (
+      id: string,
+      region: { x: number; y: number; width: number; height: number },
+    ) => {
+      if (
+        !capture ||
+        capture.id !== id ||
+        !region ||
+        !Object.values(region).every(Number.isFinite) ||
+        region.x < 0 ||
+        region.y < 0 ||
+        region.width <= 0 ||
+        region.height <= 0 ||
+        region.x + region.width > 1.001 ||
+        region.y + region.height > 1.001
+      )
+        throw new Error("Select a valid screenshot region.");
+      const image = nativeImage.createFromDataURL(capture.dataUrl);
+      const size = image.getSize();
+      const cropped = image.crop({
+        x: Math.floor(region.x * size.width),
+        y: Math.floor(region.y * size.height),
+        width: Math.max(1, Math.floor(region.width * size.width)),
+        height: Math.max(1, Math.floor(region.height * size.height)),
+      });
+      const item = await storeImage(cropped, "Selected region");
+      await selectHistory(item.id);
+      broadcast("palette:cropped", item);
+    },
+  );
   handle("palette:close", closePalette);
   handle("palette:resize", (height: number) => {
     if (!Number.isFinite(height)) return;
@@ -790,32 +1029,19 @@ function setupIPC() {
   });
   handle("result:copy", copyResult);
   handle("result:paste", async (result: PasteResult) => {
-    if (!destinationPid)
-      throw new Error(
-        "Open your destination app and invoke SnapPaste with the shortcut, or use Copy and paste manually.",
-      );
-    if (!systemPreferences.isTrustedAccessibilityClient(false))
-      throw new Error(
-        "Automatic paste needs Accessibility permission for SnapPaste. Open Settings, or use Copy.",
-      );
-    await copyResult(result);
+    const payload = clipboardPayload(validatePasteResult(result));
+    const target = destinationToken;
     window.hide();
-    try {
-      await native("paste", String(destinationPid));
-    } catch {
-      window.show();
-      throw new Error(
-        "Could not paste into the destination. The result is on your clipboard; paste it manually.",
-      );
-    }
+    await returnFocus();
+    return pasteInto(payload, target);
   });
   handle("job:cancel", () => {
     controller?.abort();
   });
   handle("window:hide", () => window.hide());
   handle("window:expand", () => positionPanel(false));
-  handle("permissions:get", () => ({
-    accessibility: systemPreferences.isTrustedAccessibilityClient(false),
+  handle("permissions:get", async () => ({
+    accessibility: !!(await pasteBridge.request("status")).trusted,
     screen: systemPreferences.getMediaAccessStatus("screen"),
   }));
   handle("permissions:open", async (kind: string) => {
@@ -902,6 +1128,18 @@ else {
       app.quit();
       return;
     }
+    pasteBridge = new NativePaste(path.dirname(helper()), process.pid);
+    catalogue = new CatalogueStore(
+      path.join(app.getPath("userData"), "cache", "definitions.json"),
+    );
+    await catalogue.open();
+    void catalogue.refresh();
+    definitionTimer = setInterval(
+      () => {
+        void catalogue.refresh();
+      },
+      6 * 60 * 60 * 1000,
+    );
     history = new HistoryStore(
       path.join(app.getPath("userData"), "screenshots"),
       getSettings().historyLimitMB * 1024 * 1024,
@@ -949,6 +1187,7 @@ else {
     tray.setToolTip("SnapPaste — capture what you see, paste what you need.");
     updateTray();
     configureWatcher();
+    void configureScreenshotFiles();
     Menu.setApplicationMenu(
       Menu.buildFromTemplate([
         {
@@ -1022,6 +1261,10 @@ app.on("before-quit", (event) => {
   controller?.abort();
   globalShortcut.unregisterAll();
   watcher?.kill();
+  pasteBridge?.close();
+  fileWatcher?.close();
+  clearInterval(definitionTimer);
+  for (const timer of fileTimers.values()) clearTimeout(timer);
   const cleanup = tempDirectory
     ? rm(tempDirectory, { recursive: true, force: true })
     : Promise.resolve();
