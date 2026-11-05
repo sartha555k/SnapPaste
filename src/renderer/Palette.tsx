@@ -416,6 +416,9 @@ export default function Palette() {
                               ? FileText
                               : Sparkles;
                   const cached = current?.preparedActions?.includes(action.id);
+                  const preparing = current?.preparingActions?.includes(
+                    action.id,
+                  );
                   return (
                     <li
                       key={action.id}
@@ -438,7 +441,9 @@ export default function Palette() {
                         <small>
                           {cached
                             ? "Prepared · ready to paste"
-                            : action.description}
+                            : preparing
+                              ? "Preparing in the background"
+                              : action.description}
                         </small>
                       </span>
                       <span
@@ -446,16 +451,20 @@ export default function Palette() {
                       >
                         {cached ? (
                           <Check size={10} />
+                        ) : preparing ? (
+                          <LoaderCircle size={10} className="sp-spin" />
                         ) : !action.cloud ? (
                           <Zap size={10} />
                         ) : null}
                         {cached
                           ? "Ready"
-                          : action.cloud
-                            ? action.localFirst
-                              ? "Local / AI"
-                              : "AI"
-                            : "Local"}
+                          : preparing
+                            ? "Preparing"
+                            : action.cloud
+                              ? action.localFirst
+                                ? "Local / AI"
+                                : "AI"
+                              : "Local"}
                       </span>
                       <kbd>{row + 1}</kbd>
                     </li>

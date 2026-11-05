@@ -48,6 +48,7 @@ export interface Capture {
   analysis: Analysis;
   local?: LocalExtraction;
   preparedActions?: string[];
+  preparingActions?: string[];
   phase: "reading" | "classifying" | "ready";
 }
 export interface PasteResult {
@@ -75,6 +76,7 @@ export interface Settings {
   openaiModel: string;
   jevModel: string;
   cloudEnabled: boolean;
+  boostMode: boolean;
   hasOpenAIKey: boolean;
   hasJevKey: boolean;
   prompts: SavedPrompt[];
@@ -87,6 +89,7 @@ export interface SettingsUpdate {
   openaiModel: string;
   jevModel: string;
   cloudEnabled: boolean;
+  boostMode: boolean;
   openaiKey?: string;
   jevKey?: string;
   clearOpenAIKey?: boolean;

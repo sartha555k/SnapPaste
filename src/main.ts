@@ -218,8 +218,20 @@ function analyzeItem(
 ): Promise<CacheEntry> {
   const fp = fingerprint();
   const cached = analysisCache.get(id);
-  if (cached?.analysis && cached.fingerprint === fp)
+  if (cached?.analysis && cached.fingerprint === fp) {
+    if (getSettings().boostMode) {
+      prepareActions({
+        id,
+        ...meta,
+        dataUrl: `data:image/png;base64,${png.toString("base64")}`,
+        ocrText: cached.text,
+        local: cached.local,
+        analysis: cached.analysis,
+        phase: "ready",
+      });
+    }
     return Promise.resolve(cached);
+  }
   const key = `${id}:${fp}`;
   const running = inflight.get(key);
   if (running) return running;
@@ -294,28 +306,7 @@ function analyzeItem(
         text,
       };
       remember(id, entry);
-      // Only slot 2 is prefetched; slots 3/4 stay demand-driven.
-      const second = analysis.actions[1];
-      if (
-        second &&
-        second.processor !== "app_control" &&
-        (localOutputSafe(subject, second.id) ||
-          (getSettings().cloudEnabled && getSettings().hasOpenAIKey))
-      ) {
-        void preparedOutput(subject, second.id)
-          .then(() => {
-            if (
-              capture?.id === id &&
-              results.has(resultKey(subject, second.id))
-            ) {
-              capture.preparedActions = [second.id];
-              emit();
-            }
-          })
-          .catch(() => {
-            /* Selection can retry a failed prefetch. */
-          });
-      }
+      prepareActions(subject);
       return entry;
     } finally {
       inflight.delete(key);
@@ -415,9 +406,6 @@ async function selectHistory(id: string) {
     next.ocrText = entry.text;
     next.local = entry.local;
     next.analysis = entry.analysis ?? fallbackAnalysis();
-    next.preparedActions = next.analysis.actions
-      .filter((a) => results.has(resultKey(next, a.id)))
-      .map((a) => a.id);
   } catch (error) {
     if (job.signal.aborted) return;
     console.error("[snappaste] screenshot analysis failed:", error);
@@ -433,7 +421,7 @@ async function selectHistory(id: string) {
   }
   if (!job.signal.aborted && capture?.id === id) {
     next.phase = "ready";
-    emit();
+    updateOutputStatus(id);
   }
 }
 async function smartPaste(): Promise<Capture> {
@@ -598,8 +586,7 @@ async function copyResult(input: PasteResult) {
     }),
   ]);
 }
-function resultKey(subject: Capture, action: string) {
-  const settings = getSettings();
+function resultKey(subject: Capture, action: string, settings = getSettings()) {
   return `${subject.id}:${subject.analysis.catalogueVersion}:${action}:${settings.openaiModel}:${settings.cloudEnabled}:${settings.hasOpenAIKey}`;
 }
 function localOutputSafe(subject: Capture, action: string) {
@@ -611,9 +598,46 @@ function localOutputSafe(subject: Capture, action: string) {
   }
 }
 function preparedOutput(subject: Capture, action: string) {
-  return results.get(resultKey(subject, action), () =>
+  const key = resultKey(subject, action);
+  const alreadyStarted = results.has(key) || results.isRunning(key);
+  const output = results.get(key, () =>
     generateOutput(subject, action, "", AbortSignal.timeout(60000)),
   );
+  if (!alreadyStarted) {
+    const refresh = () => updateOutputStatus(subject.id);
+    void output.then(refresh, refresh);
+  }
+  return output;
+}
+function updateOutputStatus(id: string) {
+  if (capture?.id !== id || capture.phase !== "ready") return;
+  const settings = getSettings();
+  capture.preparedActions = [];
+  capture.preparingActions = [];
+  for (const action of capture.analysis.actions) {
+    const key = resultKey(capture, action.id, settings);
+    if (results.has(key)) capture.preparedActions.push(action.id);
+    else if (results.isRunning(key)) capture.preparingActions.push(action.id);
+  }
+  emit();
+}
+function prepareActions(subject: Capture) {
+  const settings = getSettings();
+  const cloudAvailable = settings.cloudEnabled && settings.hasOpenAIKey;
+  const actions = settings.boostMode
+    ? subject.analysis.actions
+    : subject.analysis.actions.slice(1, 2);
+  for (const action of actions) {
+    if (action.processor === "app_control" || action.id === "custom") continue;
+    if (
+      localOutputSafe(subject, action.id) ||
+      (action.cloud && cloudAvailable)
+    ) {
+      // The cache shares in-progress work with clicks and permits retry on failure.
+      void preparedOutput(subject, action.id).catch(() => {});
+    }
+  }
+  updateOutputStatus(subject.id);
 }
 async function generateFor(
   id: string,
@@ -863,6 +887,7 @@ function setupIPC() {
       const result = saveSettings(update);
       analysisCache.clear();
       results.clear();
+      if (capture) updateOutputStatus(capture.id);
       configureWatcher();
       await history.setLimit(result.historyLimitMB * 1024 * 1024);
       historyChanged();

@@ -11,6 +11,7 @@ interface Stored {
   openaiModel: string;
   jevModel: string;
   cloudEnabled?: boolean;
+  boostMode: boolean;
   prompts: Settings["prompts"];
   openaiSecret?: string;
   jevSecret?: string;
@@ -22,6 +23,7 @@ const defaults: Stored = {
   historyLimitMB: 200,
   openaiModel: "gpt-4.1-mini",
   jevModel: "jev-1.14.0",
+  boostMode: false,
   prompts: [],
 };
 let stored: Stored | undefined;
@@ -71,6 +73,7 @@ export function getSettings(): Settings {
     // Until the user explicitly toggles it, cloud is on when environment keys exist.
     cloudEnabled:
       s.cloudEnabled ?? !!(environmentKey("openai") || environmentKey("jev")),
+    boostMode: s.boostMode === true,
     prompts: s.prompts,
     hasOpenAIKey: !!secret("openai"),
     hasJevKey: !!secret("jev"),
@@ -92,7 +95,8 @@ export function validateSettings(update: SettingsUpdate): void {
     !/^[\w.:-]{1,100}$/.test(update.openaiModel) ||
     typeof update.jevModel !== "string" ||
     !/^[\w.:-]{1,100}$/.test(update.jevModel) ||
-    typeof update.cloudEnabled !== "boolean"
+    typeof update.cloudEnabled !== "boolean" ||
+    typeof update.boostMode !== "boolean"
   )
     throw new Error("Check the shortcut and model names.");
   if (
@@ -128,6 +132,7 @@ export function saveSettings(update: SettingsUpdate): Settings {
     openaiModel: update.openaiModel.trim(),
     jevModel: update.jevModel.trim(),
     cloudEnabled: update.cloudEnabled,
+    boostMode: update.boostMode,
     prompts: update.prompts,
   };
   for (const provider of ["openai", "jev"] as const) {

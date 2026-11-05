@@ -28,6 +28,9 @@ export class ResultCache {
   has(key: string) {
     return this.ready.has(key);
   }
+  isRunning(key: string) {
+    return this.running.has(key);
+  }
   clear() {
     this.generation++;
     this.ready.clear();

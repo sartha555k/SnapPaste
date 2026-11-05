@@ -861,6 +861,7 @@ function SettingsDialog({
     openaiModel: settings.openaiModel,
     jevModel: settings.jevModel,
     cloudEnabled: settings.cloudEnabled,
+    boostMode: settings.boostMode,
     prompts: settings.prompts,
   });
   const [tab, setTab] = useState<"general" | "prompts">("general");
@@ -1009,8 +1010,7 @@ function SettingsDialog({
                   <strong>Enable cloud processing</strong>
                   <p>
                     After capture, Jev selects a screenshot type in one request.
-                    Option 2 prepares automatically when AI is needed; options 3
-                    and 4 run when selected. Supported extraction stays local.
+                    Supported extraction stays local.
                   </p>
                 </div>
                 <button
@@ -1020,6 +1020,29 @@ function SettingsDialog({
                   className={`toggle ${draft.cloudEnabled ? "on" : ""}`}
                   onClick={() =>
                     setDraft({ ...draft, cloudEnabled: !draft.cloudEnabled })
+                  }
+                >
+                  <span />
+                </button>
+              </div>
+              <div className="cloud-setting">
+                <div>
+                  <strong>Boost mode</strong>
+                  <p>
+                    Prepare all available paste outputs in parallel after
+                    capture. This can use more OpenAI requests, even if you
+                    never paste. With Boost off, SnapPaste prepares text and
+                    option 2.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-label="Boost mode"
+                  aria-checked={draft.boostMode}
+                  className={`toggle ${draft.boostMode ? "on" : ""}`}
+                  onClick={() =>
+                    setDraft({ ...draft, boostMode: !draft.boostMode })
                   }
                 >
                   <span />

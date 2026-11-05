@@ -19,7 +19,7 @@ Add Jev and OpenAI keys in Settings and enable cloud processing. Development can
 
 1. Capture with **Command+Option+S**, import images, or take a standard macOS screenshot saved to the configured screenshot folder. Optional clipboard monitoring also detects copied images.
 2. Local OCR begins in the background. Jev makes **one Choice request** over the predefined subcategories; the selected subcategory determines its four saved options. No action-ranking request is needed.
-3. Local table recognition runs alongside classification. Slot 2 prepares automatically if it has a local result or OpenAI is enabled. Slots 3 and 4 run only when selected. Concurrent prefetch/click requests share work.
+3. Local table recognition runs alongside classification. By default, text and slot 2 prepare in the background when possible. Turn on **Settings → Boost mode** to prepare all available paste outputs in parallel. This can use additional OpenAI requests even if you do not paste. Selecting an option that is still preparing reuses the same work.
 4. Focus your destination and press **Command+Option+V**. The small inline popup shows the recent screenshot and four options. Use **1–4**, **up/down + Enter**, or click. Left/right switches screenshots; Escape dismisses the popup.
 5. Output pastes into the destination. A value-extraction action opens an exact-value picker. Recovery actions allow region selection or editing local text. Original-image recovery copies the image for manual Cmd+V.
 
