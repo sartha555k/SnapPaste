@@ -4,6 +4,12 @@ Capture what you see. Paste what you need.
 
 A macOS menu-bar utility with a compact paste menu near the insertion point. It extracts and reformats visible screenshot content; it does not explain screenshots, diagnose errors or provide unsolicited advice.
 
+## Download
+
+[Visit the SnapPaste website](https://snappaste-download.vercel.app/) for the interactive demo and installation instructions, or [download the Mac installer](https://snappaste-download.vercel.app/downloads/SnapPaste-macOS-arm64-0.2.0.dmg) directly.
+
+The v0.2.0 preview is for Apple silicon Macs. macOS may flag the installer on first launch because the build is not notarized.
+
 ## Run
 
 Requires macOS, Node.js 22.12+ and Apple Command Line Tools. Full local document/table recognition requires macOS 26+. Earlier versions retain local OCR and can use AI for supported transformations.
