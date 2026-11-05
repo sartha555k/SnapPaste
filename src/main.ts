@@ -34,13 +34,27 @@ import type {
   LocalExtraction,
 } from "./shared/types";
 import { getSettings, saveSettings, validateSettings } from "./main/settings";
-import { analyzeCapture, generateOutput } from "./main/providers";
+import {
+  analyzeCapture,
+  generateOutput,
+  generateScreenshotOutput,
+  matchScreenshotGroup,
+} from "./main/providers";
+import {
+  combineScreenshotText,
+  CUSTOM_PASTE,
+  GROUP_CAPTURE_SHORTCUT,
+  TOGETHER_FALLBACK,
+  PASTE_TOGETHER_SHORTCUT,
+  togetherCases,
+  type TogetherCase,
+} from "./shared/paste-together";
 import { HistoryStore } from "./main/history";
 import { CatalogueStore } from "./main/catalogue";
 import { catalogueAnalysis } from "./shared/catalogue";
 import { annotateLocalActions, localOutput } from "./main/local";
 import { ResultCache } from "./main/result-cache";
-import { NativePaste } from "./main/native-paste";
+import { NativePaste, type PasteContext } from "./main/native-paste";
 import { placeMenu, type Placement, type Rect } from "./shared/placement";
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string;
@@ -75,9 +89,22 @@ const results = new ResultCache();
 let palette: BrowserWindow;
 let paletteAnchor: Rect = { x: 0, y: 0, width: 1, height: 1 };
 let palettePlacement: Placement | null = null;
+const TOGETHER_PALETTE_HEIGHT = 520;
 const paletteSize = { width: 390, height: 340 };
 let paletteBusy = false;
 let paletteSession = 0;
+let paletteTarget: number | undefined;
+let paletteWork: AbortController | undefined;
+let capturedGroup: HistoryItem[] = [];
+let groupSealed = false;
+let groupPreparation:
+  | {
+      key: string;
+      controller: AbortController;
+      result: Promise<TogetherCase | null>;
+      caseId?: TogetherCase | null;
+    }
+  | undefined;
 let lastClipboardChange = -1;
 
 // OCR text and Jev analysis per screenshot, persisted so older screenshots open instantly.
@@ -207,6 +234,34 @@ function remember(id: string, entry: CacheEntry) {
     }).catch(() => {});
   }, 500);
 }
+const ocrInFlight = new Map<string, Promise<LocalExtraction>>();
+function readScreenshotText(id: string, png: Buffer): Promise<LocalExtraction> {
+  const cached = analysisCache.get(id);
+  if (cached?.local) return Promise.resolve(cached.local);
+  const running = ocrInFlight.get(id);
+  if (running) return running;
+  const imagePath = path.join(tempDirectory, `${id}-ocr-${randomUUID()}.png`);
+  const work = (async () => {
+    try {
+      await writeFile(imagePath, png, { mode: 0o600 });
+      const ocr = await native("ocr", imagePath);
+      const text = String(ocr.text ?? "");
+      const local: LocalExtraction = {
+        text,
+        values: Array.isArray(ocr.values) ? ocr.values : [],
+        tables: [],
+      };
+      remember(id, { fingerprint: "", analysis: null, text, local });
+      return local;
+    } finally {
+      await rm(imagePath, { force: true }).catch(() => {});
+      ocrInFlight.delete(id);
+    }
+  })();
+  ocrInFlight.set(id, work);
+  return work;
+}
+
 /**
  * OCR + Jev classification for one screenshot. Shared by background analysis (right
  * after capture) and paste-time selection, so a screenshot is never analysed twice.
@@ -238,20 +293,8 @@ function analyzeItem(
   const work = (async () => {
     const imagePath = path.join(tempDirectory, `${id}-${randomUUID()}.png`);
     try {
-      let text = cached?.text;
-      let local = cached?.local;
-      if (text === undefined || !local) {
-        await writeFile(imagePath, png, { mode: 0o600 });
-        const ocr = await native("ocr", imagePath);
-        text = String(ocr.text ?? "");
-        local = {
-          text,
-          values: Array.isArray(ocr.values) ? ocr.values : [],
-          tables: [],
-        };
-        remember(id, { fingerprint: "", analysis: null, text, local });
-      }
-      text = text ?? "";
+      let local = await readScreenshotText(id, png);
+      const text = local.text;
       // Structure and classification run independently after the first OCR result.
       const structure = (async () => {
         if (local?.tables.length) return local.tables;
@@ -325,6 +368,7 @@ function analyzeInBackground(item: HistoryItem, png: Buffer) {
 async function storeImage(
   image: Electron.NativeImage,
   name: string,
+  grouped = false,
 ): Promise<HistoryItem> {
   if (image.isEmpty())
     throw new Error("That image could not be opened. Try a PNG or JPEG.");
@@ -346,7 +390,11 @@ async function storeImage(
     .toPNG();
   const item = await history.add(png, thumbnail, { name, width, height });
   historyChanged();
-  analyzeInBackground(item, png);
+  if (grouped) {
+    void readScreenshotText(item.id, png).catch(() => {});
+  } else {
+    analyzeInBackground(item, png);
+  }
   return item;
 }
 async function clipboardImage(): Promise<Electron.NativeImage | null> {
@@ -442,7 +490,10 @@ async function smartPaste(): Promise<Capture> {
   await selectHistory(item.id);
   return capture!;
 }
-async function captureRegion(reopen = false): Promise<HistoryItem | null> {
+async function captureRegion(
+  reopen = false,
+  grouped = false,
+): Promise<HistoryItem | null> {
   if (screenshotActive) throw new Error("Finish the current screenshot first.");
   screenshotActive = true;
   await rememberDestination();
@@ -466,16 +517,43 @@ async function captureRegion(reopen = false): Promise<HistoryItem | null> {
     } catch {
       return null;
     }
-    // Capture now, classify later. No OCR, Jev, or GPT call happens here.
     return await storeImage(
       nativeImage.createFromBuffer(bytes),
-      `Screenshot · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`,
+      `${grouped ? "Group screenshot" : "Screenshot"} · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`,
+      grouped,
     );
   } finally {
     screenshotActive = false;
     await rm(imagePath, { force: true });
     if (reopen) positionPanel(false);
   }
+}
+async function captureIntoGroup() {
+  const item = await captureRegion(false, true);
+  if (!item) return;
+  if (groupSealed || capturedGroup.length === 3) capturedGroup = [];
+  groupSealed = false;
+  if (capturedGroup.some((shot) => shot.id === item.id)) {
+    notify("That screenshot is already in the group.");
+    return;
+  }
+  capturedGroup.push(item);
+  if (capturedGroup.length >= 2) {
+    const settings = getSettings();
+    if (settings.cloudEnabled && settings.hasOpenAIKey)
+      void prepareGroup(capturedGroup.map((shot) => shot.id)).catch(() => {});
+  }
+  const add = globalShortcut.isRegistered(GROUP_CAPTURE_SHORTCUT)
+    ? "Press ⌘⌥G to add another screenshot."
+    : "Choose Capture into group from the menu bar to add another screenshot.";
+  const paste = globalShortcut.isRegistered(PASTE_TOGETHER_SHORTCUT)
+    ? "Press ⌘⌥P to paste."
+    : "Choose Paste together from the menu bar.";
+  notify(
+    capturedGroup.length === 1
+      ? `Group started. ${add}`
+      : `${capturedGroup.length} screenshots grouped. ${paste}`,
+  );
 }
 function configureWatcher() {
   watcher?.kill();
@@ -559,13 +637,18 @@ async function configureScreenshotFiles() {
 }
 function registerShortcut(
   shortcut: string,
-  kind: "paste" | "capture" = "paste",
+  kind: "paste" | "capture" | "together" | "group-capture" = "paste",
 ): boolean {
   try {
     return globalShortcut.register(shortcut, () => {
       if (kind === "capture")
         void captureRegion().catch((error) => notice(error.message));
-      else void openPalette().catch((error) => notify(error.message));
+      else if (kind === "group-capture")
+        void captureIntoGroup().catch((error) => notify(error.message));
+      else
+        void openPalette(kind === "together").catch((error) =>
+          notify(error.message),
+        );
     });
   } catch {
     return false;
@@ -671,47 +754,53 @@ function placePalette(keepEdge = false) {
     width: Math.max(1, paletteAnchor.width),
     height: Math.max(1, paletteAnchor.height),
   });
-  let placed = placeMenu(paletteAnchor, paletteSize, display.workArea);
-  // When the menu resizes in place, keep the edge next to the caret fixed.
-  if (keepEdge && palettePlacement?.side === "above") {
+  const area = display.workArea;
+  const top = area.y + 8;
+  const bottom = area.y + area.height - 8;
+  const size = {
+    ...paletteSize,
+    height: Math.min(paletteSize.height, Math.max(1, bottom - top)),
+  };
+  let placed = placeMenu(paletteAnchor, size, area);
+  // Preserve the edge next to the caret if the resized window still fits.
+  if (keepEdge && palettePlacement) {
     const bounds = palette.getBounds();
-    placed = {
-      ...palettePlacement,
-      y: Math.max(
-        display.workArea.y,
-        bounds.y + bounds.height - paletteSize.height,
-      ),
-    };
-  } else if (keepEdge && palettePlacement) placed = palettePlacement;
+    const y =
+      palettePlacement.side === "above"
+        ? bounds.y + bounds.height - size.height
+        : bounds.y;
+    if (y >= top && y + size.height <= bottom)
+      placed = { ...placed, y, side: palettePlacement.side };
+  }
   palettePlacement = placed;
-  palette.setBounds({ x: placed.x, y: placed.y, ...paletteSize });
+  palette.setBounds({ x: placed.x, y: placed.y, ...size });
 }
 function closePalette() {
   paletteSession++;
+  paletteWork?.abort();
   if (paletteBusy) controller?.abort();
   paletteBusy = false;
   if (palette?.isVisible()) palette.hide();
 }
-async function openPalette() {
+async function openPalette(together = false) {
   if (palette.isVisible()) return closePalette();
-  paletteSession++;
-  let context: Record<string, any> = {};
+  const session = ++paletteSession;
+  let context: Partial<PasteContext> = {};
   try {
     context = await pasteBridge.capture();
   } catch {
-    /* Fall back to the mouse position and the last known destination. */
+    /* Use the mouse for placement and copy if no paste target was captured. */
   }
-  if (
-    context.pid &&
-    context.pid !== process.pid &&
-    context.token !== undefined
-  ) {
+  if (session !== paletteSession) return;
+  const target = context.token;
+  if (context.pid && target !== undefined) {
     destinationPid = context.pid;
-    destinationToken = context.token;
+    destinationToken = target;
   }
   // A newly copied screenshot (e.g. Ctrl+Cmd+Shift+4) becomes the latest item.
   if (
     context.clipboardImage &&
+    context.clipboardChange !== undefined &&
     context.clipboardChange !== lastClipboardChange
   ) {
     lastClipboardChange = context.clipboardChange;
@@ -726,12 +815,41 @@ async function openPalette() {
   if (app.isHidden())
     await native("unhide", String(process.pid)).catch(() => {});
   const page = await history.list();
+  if (session !== paletteSession) return;
+  paletteTarget = target;
+  const settings = getSettings();
   paletteAnchor = context.anchor ?? cursorAnchor();
-  paletteSize.height = 340;
   palettePlacement = null;
+  // A hidden renderer can take a frame to report its new height. Make room for
+  // all five group actions before showing the panel, even after a shorter preview.
+  if (together) paletteSize.height = TOGETHER_PALETTE_HEIGHT;
   placePalette();
+  const group = together ? capturedGroup : [];
+  if (group.length) groupSealed = true;
+  const olderGroupItems = group.filter(
+    (shot) => !page.items.some((item) => item.id === shot.id),
+  );
+  const items = [
+    ...page.items.slice(0, 30 - olderGroupItems.length),
+    ...olderGroupItems,
+  ];
+  const groupIds = group.map((shot) => shot.id);
+  const cloudReady = settings.cloudEnabled && settings.hasOpenAIKey;
+  const selectedIds = groupIds.length
+    ? groupIds
+    : items
+        .slice(0, 2)
+        .reverse()
+        .map((item) => item.id);
+  const prepared =
+    together && cloudReady ? getGroupPreparation(selectedIds) : undefined;
   palette.webContents.send("palette:open", {
-    items: page.items.slice(0, 30).map((item) => ({
+    together,
+    groupIds,
+    groupMenu:
+      prepared?.caseId === undefined ? undefined : groupMenu(prepared.caseId),
+    cloudReady,
+    items: items.slice(0, 30).map((item) => ({
       id: item.id,
       name: item.name,
       createdAt: item.createdAt,
@@ -742,7 +860,10 @@ async function openPalette() {
   });
   palette.showInactive();
   palette.focus();
-  if (page.items[0]) void selectHistory(page.items[0].id);
+  if (!together && page.items[0])
+    void selectHistory(page.items[0].id).catch((error) =>
+      notify(error.message),
+    );
 }
 /**
  * A mouse click on the menu activates SnapPaste (asynchronously, sometimes after the
@@ -765,7 +886,7 @@ async function returnFocus() {
 }
 async function pasteInto(
   payload: { text: string; html: string },
-  token = destinationToken,
+  token: number | undefined,
 ) {
   const copied = async () => {
     await clipboard.write([
@@ -806,6 +927,15 @@ async function pasteInto(
     );
     return "copied";
   }
+}
+async function pastePaletteResult(result: PasteResult) {
+  if (!palette.isVisible()) throw new Error("Open the paste menu first.");
+  const payload = clipboardPayload(validatePasteResult(result));
+  const target = paletteTarget;
+  paletteBusy = false;
+  palette.hide();
+  await returnFocus();
+  return pasteInto(payload, target);
 }
 function createPalette() {
   palette = new BrowserWindow({
@@ -863,6 +993,108 @@ function handle(channel: string, fn: (...args: any[]) => any) {
     return fn(...args);
   });
 }
+function validateScreenshotIds(ids: string[], minimum: number) {
+  if (
+    !Array.isArray(ids) ||
+    ids.length < minimum ||
+    ids.length > 3 ||
+    ids.some((id) => typeof id !== "string") ||
+    new Set(ids).size !== ids.length
+  )
+    throw new Error("Choose distinct screenshots from the paste menu.");
+}
+
+async function runPaletteWork<T>(
+  work: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  if (!palette.isVisible()) throw new Error("Open the paste menu first.");
+  const session = paletteSession;
+  paletteWork?.abort();
+  const request = new AbortController();
+  paletteWork = request;
+  const signal = AbortSignal.any([request.signal, AbortSignal.timeout(60000)]);
+  try {
+    const result = await work(signal);
+    signal.throwIfAborted();
+    if (session !== paletteSession || !palette.isVisible())
+      throw new Error("The paste menu changed. Choose your screenshots again.");
+    return result;
+  } finally {
+    if (paletteWork === request) paletteWork = undefined;
+  }
+}
+
+async function loadScreenshotSources(
+  ids: string[],
+  signal: AbortSignal,
+  includeImages: boolean,
+) {
+  const captures = await Promise.all(ids.map((id) => history.get(id)));
+  if (
+    includeImages &&
+    captures.reduce((size, { image }) => size + image.length, 0) >
+      30 * 1024 * 1024
+  )
+    throw new Error(
+      "These screenshots are too large together. Choose smaller captures.",
+    );
+  return Promise.all(
+    captures.map(async ({ item, image }) => {
+      signal.throwIfAborted();
+      const local = await readScreenshotText(item.id, image).catch(() => null);
+      signal.throwIfAborted();
+      return {
+        name: item.name,
+        ocrText: local?.text ?? "",
+        dataUrl: includeImages
+          ? `data:image/png;base64,${image.toString("base64")}`
+          : "",
+      };
+    }),
+  );
+}
+
+function getGroupPreparation(ids: string[]) {
+  return groupPreparation?.key === JSON.stringify(ids)
+    ? groupPreparation
+    : undefined;
+}
+
+function groupMenu(caseId: TogetherCase | null, warning?: string) {
+  if (!caseId)
+    return { title: "General options", actions: TOGETHER_FALLBACK, warning };
+  const { title, actions } = togetherCases[caseId];
+  return { title, actions };
+}
+
+function prepareGroup(ids: string[]): Promise<TogetherCase | null> {
+  const key = JSON.stringify(ids);
+  if (groupPreparation?.key === key) return groupPreparation.result;
+  groupPreparation?.controller.abort();
+  const controller = new AbortController();
+  const signal = AbortSignal.any([
+    controller.signal,
+    AbortSignal.timeout(60000),
+  ]);
+  const result = loadScreenshotSources(ids, signal, true)
+    .then((sources) => {
+      signal.throwIfAborted();
+      return matchScreenshotGroup(sources, signal);
+    })
+    .then((caseId) => {
+      if (groupPreparation?.controller === controller)
+        groupPreparation.caseId = caseId;
+      return caseId;
+    })
+    .catch((error) => {
+      if (groupPreparation?.controller === controller)
+        groupPreparation = undefined;
+      throw error;
+    });
+  groupPreparation = { key, controller, result };
+  return result;
+}
+
 function setupIPC() {
   handle("settings:get", getSettings);
   handle("catalogue:status", () => catalogue.status());
@@ -871,12 +1103,14 @@ function setupIPC() {
     const previous = getSettings();
     globalShortcut.unregister(previous.shortcut);
     globalShortcut.unregister(previous.captureShortcut);
-    if (
-      !registerShortcut(update.shortcut) ||
-      !registerShortcut(update.captureShortcut, "capture")
-    ) {
-      globalShortcut.unregister(update.shortcut);
-      globalShortcut.unregister(update.captureShortcut);
+    const pasteRegistered = registerShortcut(update.shortcut);
+    const captureRegistered = registerShortcut(
+      update.captureShortcut,
+      "capture",
+    );
+    if (!pasteRegistered || !captureRegistered) {
+      if (pasteRegistered) globalShortcut.unregister(update.shortcut);
+      if (captureRegistered) globalShortcut.unregister(update.captureShortcut);
       registerShortcut(previous.shortcut);
       registerShortcut(previous.captureShortcut, "capture");
       throw new Error(
@@ -885,6 +1119,8 @@ function setupIPC() {
     }
     try {
       const result = saveSettings(update);
+      groupPreparation?.controller.abort();
+      groupPreparation = undefined;
       analysisCache.clear();
       results.clear();
       if (capture) updateOutputStatus(capture.id);
@@ -955,6 +1191,54 @@ function setupIPC() {
     paletteSession++;
     return selectHistory(id);
   });
+  handle("palette:match", async (ids: string[]) => {
+    validateScreenshotIds(ids, 2);
+    if (!palette.isVisible()) throw new Error("Open the paste menu first.");
+    const session = paletteSession;
+    const key = JSON.stringify(ids);
+    let caseId: TogetherCase | null = null;
+    let warning: string | undefined;
+    try {
+      caseId = await prepareGroup(ids);
+    } catch (error) {
+      warning =
+        error instanceof Error
+          ? error.message
+          : "Could not match these screenshots.";
+    }
+    if (
+      session !== paletteSession ||
+      !palette.isVisible() ||
+      (groupPreparation && groupPreparation.key !== key)
+    )
+      throw new Error("The screenshot selection changed.");
+    return groupMenu(caseId, warning);
+  });
+  handle(
+    "palette:generate",
+    async (ids: string[], actionId: ActionId, instruction = "") => {
+      validateScreenshotIds(ids, actionId === CUSTOM_PASTE.id ? 1 : 2);
+      if (typeof instruction !== "string")
+        throw new Error("Invalid instruction.");
+      const caseId = getGroupPreparation(ids)?.caseId;
+      const group = caseId ? togetherCases[caseId] : undefined;
+      const action =
+        actionId === CUSTOM_PASTE.id
+          ? CUSTOM_PASTE
+          : (group?.actions ?? TOGETHER_FALLBACK).find(
+              (option) => option.id === actionId,
+            );
+      if (actionId !== "text" && !action)
+        throw new Error("Choose an option for the selected screenshots.");
+      const result = await runPaletteWork(async (signal) => {
+        const sources = await loadScreenshotSources(ids, signal, !!action);
+        return action
+          ? generateScreenshotOutput(sources, action, instruction, signal)
+          : combineScreenshotText(sources);
+      });
+      return actionId === CUSTOM_PASTE.id ? result : pastePaletteResult(result);
+    },
+  );
   handle("palette:run", async (id: string, action: ActionId) => {
     if (
       !capture ||
@@ -963,7 +1247,6 @@ function setupIPC() {
     )
       throw new Error("Choose an option for the current screenshot.");
     const session = paletteSession;
-    const target = destinationToken;
     paletteBusy = true;
     try {
       if (action === "original") {
@@ -993,23 +1276,12 @@ function setupIPC() {
       )
         return "cancelled";
       if (result.values?.length || action === "review_text") return { result };
-      const payload = clipboardPayload(validatePasteResult(result));
-      paletteBusy = false;
-      palette.hide();
-      await returnFocus();
-      return await pasteInto(payload, target);
+      return await pastePaletteResult(result);
     } finally {
       paletteBusy = false;
     }
   });
-  handle("palette:paste", async (result: PasteResult) => {
-    const payload = clipboardPayload(validatePasteResult(result));
-    const target = destinationToken;
-    paletteBusy = false;
-    palette.hide();
-    await returnFocus();
-    return pasteInto(payload, target);
-  });
+  handle("palette:paste", pastePaletteResult);
   handle(
     "capture:crop",
     async (
@@ -1045,7 +1317,9 @@ function setupIPC() {
   handle("palette:close", closePalette);
   handle("palette:resize", (height: number) => {
     if (!Number.isFinite(height)) return;
-    paletteSize.height = Math.round(Math.min(Math.max(height, 56), 520));
+    paletteSize.height = Math.round(
+      Math.min(Math.max(height, 56), TOGETHER_PALETTE_HEIGHT),
+    );
     placePalette(true);
   });
   handle("palette:library", () => {
@@ -1109,6 +1383,24 @@ function updateTray() {
         accelerator: settings.shortcut,
         click: () => {
           void openPalette().catch((error) => notify(error.message));
+        },
+      },
+      {
+        label: "Paste together",
+        accelerator: globalShortcut.isRegistered(PASTE_TOGETHER_SHORTCUT)
+          ? PASTE_TOGETHER_SHORTCUT
+          : undefined,
+        click: () => {
+          void openPalette(true).catch((error) => notify(error.message));
+        },
+      },
+      {
+        label: "Capture into group",
+        accelerator: globalShortcut.isRegistered(GROUP_CAPTURE_SHORTCUT)
+          ? GROUP_CAPTURE_SHORTCUT
+          : undefined,
+        click: () => {
+          void captureIntoGroup().catch((error) => notify(error.message));
         },
       },
       {
@@ -1205,9 +1497,16 @@ else {
     setupIPC();
     void createPalette();
     const settings = getSettings();
-    const shortcutOk =
-      registerShortcut(settings.shortcut) &&
-      registerShortcut(settings.captureShortcut, "capture");
+    const pasteShortcutOk = registerShortcut(settings.shortcut);
+    const captureShortcutOk = registerShortcut(
+      settings.captureShortcut,
+      "capture",
+    );
+    const groupPasteOk = registerShortcut(PASTE_TOGETHER_SHORTCUT, "together");
+    const groupCaptureOk = registerShortcut(
+      GROUP_CAPTURE_SHORTCUT,
+      "group-capture",
+    );
     tray = new Tray(trayIcon());
     tray.setToolTip("SnapPaste — capture what you see, paste what you need.");
     updateTray();
@@ -1270,10 +1569,21 @@ else {
         path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
       );
     showMain();
-    if (!shortcutOk)
+    if (!pasteShortcutOk || !captureShortcutOk)
       notice(
-        "The smart-paste shortcut is already in use. Choose another in Settings.",
+        "A single-screenshot shortcut is unavailable. Choose another in Settings.",
       );
+    if (!groupCaptureOk || !groupPasteOk) {
+      const unavailable = [
+        !groupCaptureOk && "⌘⌥G (Capture into group)",
+        !groupPasteOk && "⌘⌥P (Paste together)",
+      ]
+        .filter(Boolean)
+        .join(", ");
+      notify(
+        `Could not register ${unavailable}. Use the SnapPaste menu bar instead.`,
+      );
+    }
     app.on("activate", () => {
       if (!window.isVisible()) void showPanel();
     });

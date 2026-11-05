@@ -1,11 +1,20 @@
 import type { PasteResult } from "./types";
 export function escapeHtml(value: string): string {
-  return value.replace(
-    /[&<>"']/g,
-    (c) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
-        c
-      ]!,
+  return (
+    value
+      .replace(
+        /[&<>"']/g,
+        (c) =>
+          ({
+            "&": "&amp;",
+            "<": "&lt;",
+            ">": "&gt;",
+            '"': "&quot;",
+            "'": "&#39;",
+          })[c]!,
+      )
+      // Some rich-text paste targets guess a legacy encoding for HTML fragments.
+      .replace(/[^\x00-\x7f]/gu, (c) => "&#" + c.codePointAt(0) + ";")
   );
 }
 export function markdownHtml(text: string): string {

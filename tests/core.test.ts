@@ -7,6 +7,7 @@ import {
   safeCell,
   validateResult,
 } from "../src/shared/format";
+import { combineScreenshotText } from "../src/shared/paste-together";
 import type { PasteResult } from "../src/shared/types";
 
 test("spreadsheet output preserves cells and carries a real HTML table", () => {
@@ -28,6 +29,28 @@ test("spreadsheet output preserves cells and carries a real HTML table", () => {
   assert.match(output.html, /<th[^>]*>Product<\/th>/);
   assert.match(output.html, /A&amp;B/);
   assert.doesNotMatch(output.html, /<script>/);
+});
+test("rich paste preserves punctuation and emoji under a legacy HTML decoder", () => {
+  const text = "Job hunt update 👀 Apple’s hiring — ₹500 💰";
+  const result: PasteResult = {
+    kind: "text",
+    actionId: "custom",
+    text,
+    headers: [],
+    rows: [],
+    notes: [],
+    source: "OpenAI",
+    elapsedMs: 1,
+  };
+  const output = clipboardPayload(result);
+  assert.equal(output.text, text);
+  const decodedHtml = new TextDecoder("windows-1252").decode(
+    new TextEncoder().encode(output.html),
+  );
+  assert.equal(
+    decodedHtml,
+    "<p>Job hunt update &#128064; Apple&#8217;s hiring &#8212; &#8377;500 &#128176;</p>",
+  );
 });
 test("screenshot content cannot become executable spreadsheet formulas", () => {
   for (const value of [
@@ -115,4 +138,21 @@ test("formatted paste supports headings and code without allowing source HTML", 
   assert.match(html, /<pre><code>/);
   assert.doesNotMatch(html, /<script>/);
   assert.match(html, /&lt;script&gt;/);
+});
+
+test("multi-screenshot text keeps selection order and marks an unreadable capture", () => {
+  const result = combineScreenshotText([
+    { ocrText: "Current: 084" },
+    { ocrText: " " },
+    { ocrText: "Previous: 079" },
+  ]);
+  assert.equal(result.source, "Apple Vision");
+  assert.equal(
+    clipboardPayload(result).text,
+    "Screenshot 1\nCurrent: 084\n\nScreenshot 2\n[No readable text]\n\nScreenshot 3\nPrevious: 079",
+  );
+  assert.throws(
+    () => combineScreenshotText([{ ocrText: " " }, { ocrText: "" }]),
+    /No readable text/,
+  );
 });

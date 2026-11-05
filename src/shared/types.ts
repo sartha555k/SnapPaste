@@ -133,6 +133,12 @@ export interface SnapPasteAPI {
     id: string,
     action: ActionId,
   ): Promise<"pasted" | "copied" | "cancelled" | { result: PasteResult }>;
+  paletteMatch(ids: string[]): Promise<GroupMenu>;
+  paletteGenerate(
+    ids: string[],
+    action: ActionId,
+    instruction?: string,
+  ): Promise<PasteResult | "pasted" | "copied">;
   palettePaste(result: PasteResult): Promise<string>;
   cropCapture(
     id: string,
@@ -150,7 +156,16 @@ export interface SnapPasteAPI {
   paletteLibrary(): Promise<void>;
   onPaletteOpen(callback: (state: PaletteOpen) => void): () => void;
 }
+export interface GroupMenu {
+  title: string;
+  actions: PasteAction[];
+  warning?: string;
+}
 export interface PaletteOpen {
+  together: boolean;
+  groupIds: string[];
+  groupMenu?: GroupMenu;
+  cloudReady: boolean;
   items: Pick<HistoryItem, "id" | "name" | "createdAt" | "thumbnail">[];
   app: string;
   trusted: boolean;
