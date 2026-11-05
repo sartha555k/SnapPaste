@@ -45,6 +45,7 @@ const ago = (iso: string) => {
       : new Date(iso).toLocaleDateString();
 };
 type Region = { x: number; y: number; width: number; height: number };
+type PreviewShot = PaletteOpen["items"][number];
 export default function Palette() {
   const [open, setOpen] = useState<PaletteOpen | null>(null);
   const [index, setIndex] = useState(0);
@@ -52,6 +53,10 @@ export default function Palette() {
   const [ids, setIds] = useState<string[]>([]);
   const [match, setMatch] =
     useState<Awaited<ReturnType<typeof api.paletteMatch>>>();
+  const [previewTarget, setPreviewTarget] = useState<PreviewShot | null>(null);
+  const [hoverPreview, setHoverPreview] = useState<PreviewShot | null>(null);
+  const showHoverPreview =
+    !!hoverPreview && hoverPreview.id === previewTarget?.id;
   const [writing, setWriting] = useState(false);
   const [instruction, setInstruction] = useState("");
   const [capture, setCapture] = useState<Capture | null>(null);
@@ -124,6 +129,25 @@ export default function Palette() {
       window.clearTimeout(timer);
     };
   }, [together, open, ids, match]);
+  useEffect(() => {
+    if (!previewTarget) return;
+    let active = true;
+    const timer = window.setTimeout(() => {
+      setHoverPreview(previewTarget);
+      void api.paletteScreenshotPreview(previewTarget.id).then(
+        (image) => {
+          if (active) setHoverPreview({ ...previewTarget, thumbnail: image });
+        },
+        () => {
+          // Keep the cached thumbnail if the larger image is unavailable.
+        },
+      );
+    }, 110);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [previewTarget]);
   async function runGeneratedAction(action: PasteAction, prompt?: string) {
     if (working) return;
     const token = session.current;
@@ -149,6 +173,8 @@ export default function Palette() {
       api.onPaletteOpen((state) => {
         session.current++;
         setOpen(state);
+        setPreviewTarget(null);
+        setHoverPreview(null);
         setTogether(state.together);
         setIds(state.groupIds.length ? state.groupIds : latest(2, state));
         setMatch(state.groupMenu);
@@ -415,33 +441,60 @@ export default function Palette() {
                   </button>
                 )}
               </div>
-              <div className="sp-thumbnails">
-                {open!.items.map((shot) => (
-                  <button
-                    key={shot.id}
-                    title={shot.name}
-                    aria-label={shot.name}
-                    aria-pressed={ids.includes(shot.id)}
-                    disabled={
-                      !!working ||
-                      writing ||
-                      !!result ||
-                      (ids.length === 3 && !ids.includes(shot.id))
-                    }
-                    onClick={() =>
-                      chooseSources(
-                        ids.includes(shot.id)
-                          ? ids.filter((id) => id !== shot.id)
-                          : [...ids, shot.id],
-                      )
-                    }
-                  >
-                    <img src={shot.thumbnail} alt="" />
-                    {ids.includes(shot.id) && (
-                      <kbd>{ids.indexOf(shot.id) + 1}</kbd>
-                    )}
-                  </button>
-                ))}
+              <div className="sp-preview-anchor">
+                <div className="sp-thumbnails">
+                  {open!.items.map((shot) => (
+                    <div
+                      className="sp-thumbnail"
+                      key={shot.id}
+                      onPointerEnter={(e) => {
+                        if (e.pointerType === "mouse") setPreviewTarget(shot);
+                      }}
+                      onPointerLeave={() => setPreviewTarget(null)}
+                    >
+                      <button
+                        aria-label={shot.name}
+                        aria-pressed={ids.includes(shot.id)}
+                        disabled={
+                          !!working ||
+                          writing ||
+                          !!result ||
+                          (ids.length === 3 && !ids.includes(shot.id))
+                        }
+                        onFocus={(e) => {
+                          if (e.currentTarget.matches(":focus-visible"))
+                            setPreviewTarget(shot);
+                        }}
+                        onBlur={() => setPreviewTarget(null)}
+                        onClick={() => {
+                          setPreviewTarget(null);
+                          chooseSources(
+                            ids.includes(shot.id)
+                              ? ids.filter((id) => id !== shot.id)
+                              : [...ids, shot.id],
+                          );
+                        }}
+                      >
+                        <img src={shot.thumbnail} alt="" />
+                        {ids.includes(shot.id) && (
+                          <kbd>{ids.indexOf(shot.id) + 1}</kbd>
+                        )}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <figure
+                  className="sp-hover-preview"
+                  data-visible={showHoverPreview}
+                  aria-hidden="true"
+                >
+                  {hoverPreview && (
+                    <>
+                      <img src={hoverPreview.thumbnail} alt="" />
+                      <figcaption>{hoverPreview.name}</figcaption>
+                    </>
+                  )}
+                </figure>
               </div>
               {ids.length < 2 && (
                 <p>Pick two or three screenshots from history.</p>

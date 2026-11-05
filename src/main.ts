@@ -1191,6 +1191,22 @@ function setupIPC() {
     paletteSession++;
     return selectHistory(id);
   });
+  handle("palette:screenshot-preview", async (id: string) => {
+    if (!palette.isVisible()) throw new Error("Open the paste menu first.");
+    if (typeof id !== "string") throw new Error("Invalid screenshot.");
+    const { image } = await history.get(id);
+    const preview = nativeImage.createFromBuffer(image);
+    if (preview.isEmpty()) throw new Error("Could not open the screenshot.");
+    const { width, height } = preview.getSize();
+    const scale = Math.min(1, 840 / Math.max(width, height));
+    return preview
+      .resize({
+        width: Math.max(1, Math.round(width * scale)),
+        height: Math.max(1, Math.round(height * scale)),
+        quality: "good",
+      })
+      .toDataURL();
+  });
   handle("palette:match", async (ids: string[]) => {
     validateScreenshotIds(ids, 2);
     if (!palette.isVisible()) throw new Error("Open the paste menu first.");

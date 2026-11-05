@@ -2,6 +2,8 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { Capture, PaletteOpen, SnapPasteAPI } from "./shared/types";
 const api: SnapPasteAPI = {
   catalogueStatus: () => ipcRenderer.invoke("catalogue:status"),
+  paletteScreenshotPreview: (id) =>
+    ipcRenderer.invoke("palette:screenshot-preview", id),
   paletteMatch: (ids) => ipcRenderer.invoke("palette:match", ids),
   paletteGenerate: (ids, action, instruction) =>
     ipcRenderer.invoke("palette:generate", ids, action, instruction),

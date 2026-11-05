@@ -133,6 +133,7 @@ export interface SnapPasteAPI {
     id: string,
     action: ActionId,
   ): Promise<"pasted" | "copied" | "cancelled" | { result: PasteResult }>;
+  paletteScreenshotPreview(id: string): Promise<string>;
   paletteMatch(ids: string[]): Promise<GroupMenu>;
   paletteGenerate(
     ids: string[],
